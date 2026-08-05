@@ -52,6 +52,19 @@ source of truth for content — it is the **scope ceiling**:
 - Do not preview upcoming days, add "bonus" material, or deepen a topic beyond what its
   checkpoint questions require.
 
+## Retention: spaced retrieval and cheat sheets
+
+Two practices borrowed deliberately from the `teach` skill (adopted 2026-08-05) without
+its workspace:
+
+- **Opening re-quiz.** Every day starts with ~3 checkpoint questions from *previous*
+  days, answered aloud from memory before any new material. Five minutes, no more —
+  the goal is spaced retrieval, not a second lesson. Pick questions 2–4 days old.
+- **Weekly cheat sheet.** Closing a week produces one compact English reference in
+  `<week-block>/reference/` — the compressed essence of that week (commands, states,
+  patterns), designed to be reread before an interview. `NOTES.md` records what
+  happened; the cheat sheet is what gets revisited. Day notes are not a substitute.
+
 ## Conventions that matter
 
 **Language split.** `CURRICULUM.md` and planning prose are in Ukrainian. Everything that
@@ -91,6 +104,7 @@ read-only — editing them invalidates the lock hash.
 
 Invoking `/teach` turns the working directory into a stateful teaching workspace with its
 own files (`MISSION.md`, `RESOURCES.md`, `learning-records/`, `lessons/`, `reference/`,
-`assets/`). None exist yet. That system is separate from the curriculum/day-notes flow
-above; if it is used, keep the two from drifting into duplicate records of the same
-learning.
+`assets/`). None exist yet. **Decision (2026-08-05): the full workspace is deliberately
+not used** — `MISSION.md`/`learning-records/`/`lessons/` would duplicate the
+curriculum/day-notes flow above. Only two of its ideas are adopted (see "Retention"):
+the opening re-quiz and weekly cheat sheets. Do not create the other teach files.
