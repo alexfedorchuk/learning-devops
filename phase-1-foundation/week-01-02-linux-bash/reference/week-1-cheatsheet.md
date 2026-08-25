@@ -1,7 +1,7 @@
 # Week 1 cheat sheet — processes, permissions, SSH, systemd
 
 Compressed from days 1–5. Full write-ups and command-by-command history live in each
-day's `NOTES.md`; this is the reread-before-an-interview version.
+day's `NOTES.md`; this is the version to reread weeks later.
 
 ## Processes & `/proc` (day 1)
 

@@ -5,7 +5,7 @@ you're asking, not by the day it was learned. Terse on purpose — no explanatio
 what each command answers and the traps that make it silently wrong.
 
 This is the *lookup* half of the reference. The `week-N-cheatsheet.md` files are the
-*retention* half — prose, mechanisms, and the "why" for rereading before an interview.
+*retention* half — prose, mechanisms, and the "why", for rereading weeks later.
 Different jobs; when in doubt, Cmd-F this file first.
 
 Covers days 1–10. Append as later days land; keep it task-indexed, never

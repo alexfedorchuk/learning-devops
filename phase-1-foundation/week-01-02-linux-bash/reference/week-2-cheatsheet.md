@@ -2,7 +2,7 @@
 
 Compressed from days 6–10. Full write-ups and command history live in each day's
 `NOTES.md`; commands for mid-task lookup live in `commands.md`. This is the
-reread-before-an-interview version: mechanisms and why they bite.
+version to reread weeks later: mechanisms and why they bite.
 
 ## journald, timers, sandboxing (day 6)
 

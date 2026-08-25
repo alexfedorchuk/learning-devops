@@ -165,6 +165,6 @@ saying it.
   is available — today's version used a still-open second SSH session as the recovery
   path instead, since no physical keyboard was on hand (Bluetooth-only Magic Keyboard
   doesn't work at this boot stage — no pairing possible without existing input).
-- Cloud equivalents of physical console recovery worth knowing by name for
-  interviews: AWS EC2 Serial Console / Systems Manager Session Manager, GCP Cloud
+- Cloud equivalents of physical console recovery worth knowing by name:
+  AWS EC2 Serial Console / Systems Manager Session Manager, GCP Cloud
   Shell serial port, Azure Serial Console, IPMI/iDRAC/iLO for real/colo hardware.

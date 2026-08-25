@@ -62,7 +62,7 @@ its workspace:
   the goal is spaced retrieval, not a second lesson. Pick questions 2–4 days old.
 - **Weekly cheat sheet.** Closing a week produces one compact English reference in
   `<week-block>/reference/` — the compressed essence of that week (commands, states,
-  patterns), designed to be reread before an interview. `NOTES.md` records what
+  patterns), designed to be reread weeks later. `NOTES.md` records what
   happened; the cheat sheet is what gets revisited. Day notes are not a substitute.
 
 A third reference serves a different need (added 2026-08-25):
