@@ -65,6 +65,15 @@ its workspace:
   patterns), designed to be reread before an interview. `NOTES.md` records what
   happened; the cheat sheet is what gets revisited. Day notes are not a substitute.
 
+A third reference serves a different need (added 2026-08-25):
+
+- **Command lookup card**, `<week-block>/reference/commands.md`. Retention and lookup
+  are separate problems: cheat sheets are prose to *reread*, this is command-first
+  material to *search* when stuck mid-task. Organised by the question being asked
+  ("disk is full", "writing a bash script"), never chronologically, so finding
+  something never requires remembering which week taught it. Append to it as days
+  land; keep entries terse and include the traps that make a command silently wrong.
+
 ## Conventions that matter
 
 **Language split.** `CURRICULUM.md` and planning prose are in Ukrainian. Everything that
