@@ -17,8 +17,18 @@ LAST_CHANGED=0     # did the most recent write_file change anything
 
 TMP_FILE=""
 
+# Resolved so the script can be invoked by any path; monitor.sh must sit next
+# to it. Keeping the monitor in its own file is what lets shellcheck see it —
+# it cannot look inside a heredoc.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 SSHD_DROPIN=/etc/ssh/sshd_config.d/00-hardening.conf
 APT_AUTO=/etc/apt/apt.conf.d/20auto-upgrades
+MONITOR_SRC="$SCRIPT_DIR/monitor.sh"
+MONITOR_BIN=/usr/local/sbin/lab-monitor
+MONITOR_ENV=/etc/lab-monitor.env
+MONITOR_SERVICE=/etc/systemd/system/lab-monitor.service
+MONITOR_TIMER=/etc/systemd/system/lab-monitor.timer
 
 usage() {
   cat <<EOF
@@ -104,6 +114,7 @@ preflight() {
   (( EUID == 0 )) || die "must be run as root"
   command -v apt-get >/dev/null || die "needs a Debian/Ubuntu system"
   [[ -n $USER_NAME ]] || die_usage "--user is required"
+  [[ -f $MONITOR_SRC ]] || die "monitor.sh not found next to this script: $MONITOR_SRC"
 }
 
 ensure_user() {
@@ -164,7 +175,11 @@ ensure_user() {
 }
 
 setup_firewall() {
-  run apt-get update -qq
+  # Error-Mode=any turns apt's "W: Failed to fetch ..." into a real failure.
+  # By default `apt-get update` exits 0 when it cannot reach a single mirror —
+  # it falls back to the indexes it already has — and the script would carry on
+  # installing from a stale cache, failing later with an unrelated message.
+  run apt-get update -qq -o APT::Update::Error-Mode=any
   run apt-get install -y -qq ufw
 
   # The SSH rule must exist before default-deny takes effect, or enabling the
@@ -201,14 +216,67 @@ KbdInteractiveAuthentication no
 AllowUsers $USER_NAME
 EOF
   run chmod 0644 "$SSHD_DROPIN"
+  local config_changed="$LAST_CHANGED"
 
-  (( LAST_CHANGED )) || { log "sshd config unchanged, no reload needed"; return 0; }
+  # /run is a tmpfs and /run/sshd is created by ssh.service's RuntimeDirectory=.
+  # On a machine where sshd has never started, the directory does not exist and
+  # `sshd -t` refuses to check anything at all.
+  run install -d -m 0755 /run/sshd
 
-  # Validate first: sshd refuses to start on a bad config, which on a
-  # firewalled box means no way back in. Reload, not restart — existing
-  # sessions are separate forks and survive it.
+  # Validate before touching the running service: sshd refuses to start on a bad
+  # config, which on a firewalled box means no way back in.
   run sshd -t
-  run systemctl reload ssh
+
+  # Deliberately two independent checks, not if/elif: Ubuntu 24.04 can have both
+  # units enabled and active at once, each holding a listener on the same port.
+  # Assuming they are exclusive would move one and leave the other behind.
+  local handled=0
+
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    harden_ssh_socket
+    handled=1
+  fi
+
+  if systemctl is-active --quiet ssh; then
+    handled=1
+    if (( config_changed )); then
+      # Reload, not restart — existing sessions are separate forks and survive it.
+      # A standalone sshd takes its port from sshd_config, so this is what moves it.
+      run systemctl reload ssh
+    else
+      log "sshd config unchanged, no reload needed"
+    fi
+  fi
+
+  (( handled )) || log "neither ssh.service nor ssh.socket is enabled; config written only"
+}
+
+# Ubuntu 24.04 ships sshd socket-activated: systemd owns the listening socket
+# and hands the connection to `sshd -i`. The Port keyword in sshd_config is then
+# ignored entirely, so the port has to move in the socket unit instead. Every
+# other keyword (AllowUsers, PasswordAuthentication) still comes from sshd_config.
+harden_ssh_socket() {
+  local dropin=/etc/systemd/system/ssh.socket.d/00-port.conf
+
+  run install -d -m 0755 /etc/systemd/system/ssh.socket.d
+  write_file "$dropin" <<EOF
+# Managed by ${0##*/} — do not edit by hand.
+[Socket]
+# The empty assignment clears the inherited list. Without it ListenStream=
+# entries accumulate and the socket keeps listening on 22 as well.
+ListenStream=
+ListenStream=$SSH_PORT
+EOF
+  run chmod 0644 "$dropin"
+
+  # Only the socket needs restarting. A changed sshd_config needs no reload here:
+  # every connection execs a fresh sshd, which reads the config as it starts.
+  (( LAST_CHANGED )) || { log "ssh.socket already on port $SSH_PORT"; return 0; }
+
+  run systemctl daemon-reload
+  # Sockets cannot be reloaded, only restarted. Established sessions are
+  # separate ssh@.service instances and are not affected.
+  run systemctl restart ssh.socket
 }
 
 security_updates() {
@@ -226,6 +294,87 @@ EOF
   run systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
 }
 
+install_monitoring() {
+  local units_changed=0
+
+  run apt-get install -y -qq curl
+
+  # write_file reads stdin, so the source file is simply redirected in: the
+  # install becomes content-compared, and a rerun with an unchanged monitor.sh
+  # counts as no change.
+  write_file "$MONITOR_BIN" <"$MONITOR_SRC"
+  run chmod 0755 "$MONITOR_BIN"
+
+  # Deliberately NOT write_file: this file ends up holding the bot token, and
+  # write_file would overwrite it with the empty template on the next run.
+  if [[ -f $MONITOR_ENV ]]; then
+    log "unchanged: $MONITOR_ENV (holds credentials, never rewritten)"
+  else
+    log "creating credentials template: $MONITOR_ENV"
+    CHANGED=$(( CHANGED + 1 ))
+    if (( ! DRY_RUN )); then
+      # Created with its final mode before it has any content: a secret must
+      # never exist world-readable, not even for the moment before a chmod.
+      install -m 0600 /dev/null "$MONITOR_ENV"
+      cat >"$MONITOR_ENV" <<'EOF'
+# Credentials for lab-monitor. Mode 0600, root only, never committed.
+# Leave empty to keep the summary in the journal and send nothing.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+EOF
+    fi
+  fi
+
+  write_file "$MONITOR_SERVICE" <<EOF
+# Managed by ${0##*/} — do not edit by hand.
+[Unit]
+Description=Machine health summary (disk, memory, load, failed units)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$MONITOR_BIN
+# systemd creates and owns the state directory; the unit gets it writable even
+# under ProtectSystem=strict, which makes the rest of the filesystem read-only.
+StateDirectory=lab-monitor
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+EOF
+  run chmod 0644 "$MONITOR_SERVICE"
+  if (( LAST_CHANGED )); then units_changed=1; fi
+
+  write_file "$MONITOR_TIMER" <<EOF
+# Managed by ${0##*/} — do not edit by hand.
+[Unit]
+Description=Run the machine health summary every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# No Persistent=true: it only applies to OnCalendar=, and catching up a missed
+# health check after a reboot is pointless — the reading would be stale anyway.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+  run chmod 0644 "$MONITOR_TIMER"
+  if (( LAST_CHANGED )); then units_changed=1; fi
+
+  # Only on an actual change: daemon-reload on every run would be noise, and it
+  # is exactly the step people forget, so it has to be tied to the write.
+  if (( units_changed )); then
+    log "unit files changed, reloading systemd"
+    run systemctl daemon-reload
+  fi
+
+  run systemctl enable --now lab-monitor.timer
+}
+
 # Asserts what the system reports, not what was written: a config file can be
 # present, correct and completely ignored.
 verify() {
@@ -234,7 +383,7 @@ verify() {
     return 0
   fi
 
-  local sshd_conf ufw_state apt_conf
+  local sshd_conf ufw_state apt_conf listening
 
   # Captured, not piped into grep: `grep -q` exits on the first match and closes
   # the pipe, the producer dies of SIGPIPE (141), and pipefail turns a matching
@@ -243,17 +392,35 @@ verify() {
   sshd_conf="$(sshd -T)"
   ufw_state="$(ufw status)"
   apt_conf="$(apt-config dump)"
+  listening="$(ss -ltn)"
 
   log "verifying effective state"
   id -u "$USER_NAME" >/dev/null 2>&1 || die "verify: user $USER_NAME is missing"
   grep -qix "passwordauthentication no" <<<"$sshd_conf" || die "verify: sshd still accepts passwords"
   grep -qix "allowusers $USER_NAME"     <<<"$sshd_conf" || die "verify: sshd does not allow $USER_NAME"
-  grep -qix "port $SSH_PORT"            <<<"$sshd_conf" || die "verify: sshd is not on port $SSH_PORT"
+  # NOT `sshd -T | grep port`: under socket activation sshd reports the Port
+  # keyword it was given and systemd ignores it, so that check passes on a
+  # machine nothing is listening on. Only the open socket is evidence.
+  awk -v p=":$SSH_PORT" '$4 ~ p"$" { found = 1 } END { exit !found }' <<<"$listening" \
+    || die "verify: nothing is listening on port $SSH_PORT"
+
+  # A warning, not a failure: port 22 stays allowed in the firewall on purpose so
+  # moving the port cannot lock anyone out. Still worth saying out loud, because
+  # a second listener means one of the two ssh units was not moved.
+  if (( SSH_PORT != 22 )) && awk '$4 ~ /:22$/ { found = 1 } END { exit !found }' <<<"$listening"; then
+    log "warning: something is still listening on port 22"
+  fi
   grep -q  '^Status: active'            <<<"$ufw_state" || die "verify: ufw is not active"
   grep -q  '^APT::Periodic::Unattended-Upgrade "1";$' <<<"$apt_conf" \
     || die "verify: automatic upgrades are switched off"
   systemctl is-enabled --quiet apt-daily-upgrade.timer \
     || die "verify: apt-daily-upgrade.timer is not enabled"
+
+  # enabled says it survives a reboot, active says it is actually counting down
+  # right now. A timer can be one without the other.
+  [[ -x $MONITOR_BIN ]] || die "verify: $MONITOR_BIN is missing or not executable"
+  systemctl is-enabled --quiet lab-monitor.timer || die "verify: lab-monitor.timer is not enabled"
+  systemctl is-active  --quiet lab-monitor.timer || die "verify: lab-monitor.timer is not active"
   log "verified"
 }
 
@@ -294,6 +461,7 @@ main() {
   setup_firewall    # the port must be open before sshd starts listening on it
   harden_ssh
   security_updates
+  install_monitoring
   verify
   log "done — changes applied: $CHANGED"
 }

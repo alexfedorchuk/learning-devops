@@ -1,31 +1,48 @@
 # artifact-server-bootstrap — build notes
 
-Started: 2026-08-26 (day 11 of week 1–2)
-Target: Ubuntu 24.04 LTS (arm64). Developed against the Pi, to be verified in a
-clean LXD container.
+Started: 2026-08-26 (day 11), finished: 2026-08-30 (day 12)
+Target: Ubuntu 24.04 LTS (arm64). Developed against the Pi, verified on clean
+LXD containers running on it.
 
 ## Status against the definition of done
 
-`CURRICULUM.md`, days 11–12. Seven of eleven closed.
+`CURRICULUM.md`, days 11–12. All eleven closed.
 
-| | Requirement | State |
+| | Requirement | Where it was proven |
 |---|---|---|
-| ✅ | admin user with SSH key, passwordless sudo for that user only | written, dry-run verified |
-| ✅ | sshd hardening: no passwords, no root, custom port, `AllowUsers` | written, dry-run verified |
-| ✅ | firewall: default deny incoming, SSH allowed | written, dry-run verified |
-| ✅ | `unattended-upgrades` enabled and configured | written, dry-run verified |
-| ✅ | `set -euo pipefail`, `trap` cleanup, every step logged | done |
-| ✅ | `--dry-run` mode | done, verified to leave system state byte-identical |
-| ✅ | passes `shellcheck` with no warnings | clean, checked on the Pi (`/usr/bin/shellcheck`) |
-| ❌ | monitoring timer: disk, memory, load, failed units + Telegram alert | **not started** |
-| ❌ | runs twice, second run changes nothing | **not verified** — dry-run only |
-| ❌ | verified on a genuinely clean machine | **not done** |
-| ❌ | English README | **not written** |
+| ✅ | admin user with SSH key, passwordless sudo for that user only | clean container, run 1 of 3 |
+| ✅ | sshd hardening: no passwords, no root, custom port, `AllowUsers` | clean container; port confirmed with `ss -ltn`, not with `sshd -T` |
+| ✅ | firewall: default deny incoming, SSH allowed | clean container; `ufw` works in an unprivileged LXD container |
+| ✅ | `unattended-upgrades` enabled and configured | clean container, `apt-config dump` |
+| ✅ | monitoring timer: disk, memory, load, failed units + Telegram alert | clean container; timer fired, summary in the journal |
+| ✅ | `set -euo pipefail`, `trap` cleanup, every step logged | |
+| ✅ | `--dry-run` mode | dry-run predicted 10 changes, the real run applied exactly 10 |
+| ✅ | passes `shellcheck` with no warnings | Pi, shellcheck 0.9.0, all three scripts |
+| ✅ | runs twice, second run changes nothing | `changes applied: 0`, twice, on two separate containers |
+| ✅ | verified on a genuinely clean machine | `lxc launch ubuntu:24.04`, destroyed and recreated between passes |
+| ✅ | English README | `README.md` |
 
-Honest status: *passes shellcheck and has a correct dry-run*. It has never been
-run for real. Nothing below the line has been demonstrated.
+## Re-quiz (day 12, spaced retrieval)
 
-## What I did
+Three questions from days 8–10, answered aloud before any new material — two
+correct, one wrong.
+
+1. Day 8: why can an unattended `apt upgrade` take down production? **Correct.**
+   `unattended-upgrades` takes only the security pocket, `apt upgrade` takes
+   everything. Sharpened: the real damage is not "unread changelog" but that a
+   package upgrade **restarts its daemon** — `needrestart` will do it mid-day —
+   and that a new kernel installs without taking effect until a reboot.
+2. Day 9: `rm -rf "$DIR/"` with `DIR` unset — what happens, what saves you?
+   **Wrong.** Answered `--preserve-root`. It is real and it is the default, but
+   it only covers the literal `/`: `rm -rf "$DIR/logs"` expands to `/logs` and
+   is deleted without a word, and BusyBox has no such check. The answer under my
+   own control is `set -u` — the `u` in the `set -euo pipefail` already at the
+   top of this artifact — or `${DIR:?message}` at the point of use.
+3. Day 10: `2>&1 >file` vs `>file 2>&1`. **Correct.** Sharpened wording: `2>&1`
+   *copies fd1's current target* into fd2. A copy, not a link — which is exactly
+   why the later `>file` moves fd1 and fd2 stays on the terminal.
+
+## Day 11 — what I did
 
 1. Built `bootstrap.sh` around one idea: idempotency is a property of the
    **check**, not of the command. Prefer commands that are safe to repeat
@@ -40,128 +57,152 @@ run for real. Nothing below the line has been demonstrated.
    `harden_ssh` → `security_updates` → `verify`.
 4. `verify` asserts **effective state** — `sshd -T`, `ufw status`,
    `apt-config dump`, `systemctl is-enabled` — never the files just written.
-   This is week 2's recurring lesson turned into a design requirement.
 5. Verified on the Pi: `shellcheck` clean, `--help` works unprivileged, usage
    errors exit 2 and runtime errors exit 1, and a dry-run left
    `00-hardening.conf`, `/etc/sudoers.d/`, ufw state and the user list
    byte-identical.
 
-## What broke
+## Day 11 — what broke
 
 Every one of these was found by **running** the script, not by reading it.
 `shellcheck` saw none of them.
 
-1. **`pipefail` turned a normal situation fatal.** The first dry-run stopped
-   silently after one step, exit 2:
+1. **`pipefail` turned a normal situation fatal.** `home="$(getent passwd "$USER_NAME" | cut -d: -f6)"`
+   — `getent` exits 2 for an unknown user, exactly the expected case in a
+   dry-run, and `set -e` killed the script before the `${home:-...}` fallback on
+   the next line could run. Fixed with `|| true`.
+2. **`grep -q` killed its own producer — SIGPIPE, exit 141.** `sshd -T | grep -qix ...`
+   failed while the value was correct: `grep -q` exits on the first match, the
+   producer takes SIGPIPE, `pipefail` promotes 141. Worse than a consistent bug
+   because it is a **race** — the short `ufw status` survived, the long
+   `sshd -T` did not. Fixed by capturing output and grepping a herestring.
+3. **`verify` asserted on the wrong unit.** It checked
+   `unattended-upgrades.service`, which is only the *shutdown* handler. The
+   periodic work is `apt-daily.timer` / `apt-daily-upgrade.timer` reading
+   `APT::Periodic::*`. Demonstrated by switching upgrades fully off and watching
+   `verify` still pass — the precise failure it exists to prevent.
 
-   ```bash
-   home="$(getent passwd "$USER_NAME" | cut -d: -f6)"
-   ```
+## Day 12 — what I did
 
-   `getent` exits 2 for an unknown user — exactly the expected case in a dry-run
-   for a user not created yet. Without `pipefail` the pipeline would return
-   `cut`'s 0; with it the assignment fails and `set -e` kills the script, before
-   the `${home:-/home/$USER_NAME}` fallback on the very next line could run. The
-   comment promising that fallback was sitting right above the line that made it
-   unreachable. Fixed with `|| true`.
+1. Split the monitor into its own file. `shellcheck` cannot look inside a
+   heredoc, so a monitor embedded in `bootstrap.sh` would have been the one part
+   of the artifact the linter never saw.
+2. Decided the three things that make it an artifact rather than a script:
+   credentials in a root-owned `0600` file outside the repo; the summary to
+   stdout so journald owns history and rotation; Telegram **only on a change in
+   the set of active alerts**, so an alert stays a signal.
+3. Wrote `monitor-v1.sh` first — the same requirement in 56 lines — and kept it
+   deliberately. The diff between it and `monitor.sh` is a list of concrete
+   failures: alert spam every 15 minutes, an alert silently lost when the
+   network is down, and the bot token visible in `ps` to every user on the box.
+4. Verified on clean LXD containers: `lxc launch ubuntu:24.04`, dry-run, run,
+   run again, destroy, repeat. Then broke it on purpose.
 
-2. **`grep -q` killed its own producer — SIGPIPE, exit 141.** `verify` failed its
-   first sshd assertion even though the value was correct:
+## Day 12 — what broke
 
-   ```bash
-   sshd -T | grep -qix "passwordauthentication no"    # exit 141
-   ```
+1. **My own firewall broke the test environment.** The container could not
+   resolve anything, and `apt-get update` reported four `W: Failed to fetch`
+   lines. Cause: the Pi's `default deny incoming` from day 8 dropped DHCP and
+   DNS coming from `lxdbr0`, so the container never got a lease. Fixed on the
+   **host** with `ufw allow in on lxdbr0` + `ufw route allow in on lxdbr0` — and
+   the container had to be restarted, because nothing re-requests a lease that
+   was never granted. The symptom pointed at apt; the cause was three days old.
 
-   `grep -q` exits on the first match and closes the pipe; `sshd -T` is still
-   writing, takes SIGPIPE, dies with 128+13; `pipefail` promotes that to the
-   pipeline. A passing check reports failure.
+2. **`apt-get update` exits 0 when it cannot reach a single mirror.** Those `W:`
+   lines are warnings by design: apt falls back to the indexes it already has.
+   So the script sailed past a machine with no network at all and only failed
+   later, with a message about a package. Fixed with
+   `-o APT::Update::Error-Mode=any`, which turns those warnings into a real
+   failure.
 
-   Worse than a consistent bug, because it is a **race**: `ufw status` is short
-   enough to finish writing before grep exits, so that call worked, while the
-   longer `sshd -T` did not. Fixed in all three places by capturing output first
-   and grepping a herestring.
+3. **`sshd -t` could not run: `Missing privilege separation directory: /run/sshd`.**
+   `/run` is a tmpfs and `/run/sshd` is created by `RuntimeDirectory=sshd` when
+   ssh starts. On a machine where sshd has never started, the *validation step*
+   itself is impossible. Invisible on the Pi, where sshd has run since boot.
+   Fixed with `install -d -m 0755 /run/sshd` before the check.
 
-3. **`verify` asserted on the wrong unit entirely.** It checked
-   `systemctl is-enabled unattended-upgrades`, but that unit is
-   `Description=Unattended Upgrades **Shutdown**` — the handler that holds
-   shutdown while an upgrade finishes. The periodic work is done by
-   `apt-daily.timer` / `apt-daily-upgrade.timer` reading `APT::Periodic::*`.
+4. **sshd is socket-activated on Ubuntu 24.04 — and that silently defeated
+   `verify`.** In the container `ssh.socket` is enabled and `ssh.service` is
+   disabled: systemd owns the listening socket and hands the connection to
+   `sshd -i`. The `Port` keyword in `sshd_config` is then **ignored entirely**.
 
-   Demonstrated by switching automatic upgrades fully off and re-running:
+   `sshd -T` still reports `port 2222`, so `verify` passed while nothing was
+   listening on 2222 — the script would have declared success on a machine
+   nobody could reach. This is week 2's "the file is right, nothing reads it"
+   lesson, one level up: it walked straight through the check written to catch it.
 
-   ```
-   apt-config dump  ->  APT::Periodic::Unattended-Upgrade "0"
-   verify           ->  passed
-   ```
+   Fixed in three places: a `ssh.socket.d/00-port.conf` drop-in whose first line
+   is an empty `ListenStream=` (the list is inherited and accumulates — without
+   clearing it the socket keeps listening on 22 too), `restart` rather than
+   `reload` because sockets cannot be reloaded, and `verify` now asserting
+   against `ss -ltn` instead of `sshd -T`. Confirmed afterwards:
+   `LISTEN 0 4096 0.0.0.0:2222 users:(("systemd",pid=1,fd=54))`, and nothing on 22.
 
-   So `verify` would have declared success on a machine with automatic upgrades
-   disabled — the precise failure it exists to prevent. Now checks
-   `apt-config dump` and `apt-daily-upgrade.timer`.
+5. **`trap ... INT` did nothing.** Sent SIGINT to a run 6 seconds in; the script
+   kept going. Bash starts a background child in a non-interactive shell with
+   SIGINT set to `SIG_IGN`, and a signal ignored on entry **cannot be trapped or
+   reset** — the `trap 'exit 130' INT` at the bottom of the file was silently
+   inert, exactly as suspected on day 11. SIGTERM worked and exited 143. The
+   lesson is not "add a trap" but that a trap is only as real as the launch
+   context allows, and nothing warns you.
 
-## What surprised me
+6. **A failed run leaves partial state.** Killed during `apt-get update`, the
+   machine was left with the user and its sudoers rule created, no firewall, no
+   sshd hardening. The controlled version — a missing key file — left `broke`
+   created with no key and no sudo rule at all. The script is **idempotent, not
+   transactional**: it does not roll back, it converges on the next run. Proved
+   it: re-running after the interrupt applied 7 changes and the run after that
+   applied 0.
 
-- That strict mode bites for **expected** non-zero exits at least as often as it
-  catches real bugs. Three times in two days: `local x=$(false)` masking a
-  status, `getent` returning 2 for a missing user, `grep -q` SIGPIPE-ing its
-  producer. `pipefail` is what converts each of them from harmless to fatal.
-  The working rule: wherever a pipeline can legitimately end non-zero, say so
-  explicitly (`|| true`) or remove the pipeline.
-- That `/etc/apt/apt.conf.d/20auto-upgrades` is owned by no package at all
-  (`dpkg -S` finds nothing). The postinst generates it by copying either
-  `/usr/share/unattended-upgrades/20auto-upgrades` or `-disabled`, chosen by the
-  debconf answer `unattended-upgrades/enable_auto_updates` (template default:
-  true). So writing it is usually redundant — but the value depends on an answer
-  an image builder can preseed to false. Declaring it means the outcome does not
-  depend on someone else's default.
-- How much of "is it configured?" is answered only by logs. The Pi's
-  `unattended-upgrades.log` has 53 recorded runs and shows it removing superseded
-  kernels. Config plus an enabled timer says it *should* work; the log is what
-  says it *did*.
+7. **The two ssh units are not mutually exclusive — found on the Pi, not in the
+   container.** Checking the lab server afterwards: `ssh` and `ssh.socket` are
+   **both enabled and both active**, and `ss -ltnp` shows two owners of port 22 —
+   `sshd` (pid 71254) and `systemd` (pid 1). My first fix used `if/elif` and
+   treated them as alternatives, so on that machine it would have moved the
+   socket to 2222 and left `ssh.service` serving 22. Rewritten as two
+   independent checks: the socket gets its drop-in, a running `ssh.service` gets
+   a reload, and `verify` now also warns when something is still listening on 22
+   after the port has moved. The container only ever showed the socket-only
+   case; the Pi is what showed the combination.
 
-## Remaining work — day 12
+8. **The control channel died mid-run and the work kept going.** `lxc exec`
+   dropped with `websocket: close 1006 (abnormal closure)` during
+   `apt-get update` on a loaded Pi. The script's process went with it, but
+   `apt-get` itself survived as an orphan, so the next run hit
+   `Could not get lock /var/lib/apt/lists/lock. It is held by process 715`.
+   Not a bug in the artifact — a reminder that killing the thing you started is
+   not the same as killing what it started, and that "run it again" needs the
+   previous run to be genuinely finished.
 
-In this order, because the clean-machine run should exercise the finished
-artifact rather than half of it.
+## Day 12 — what surprised me
 
-1. **Monitoring timer** — the only missing feature. A summary script (disk,
-   memory, load, failed units) driven by a systemd timer, alerting to Telegram
-   past thresholds. Add `/var/run/reboot-required` to the summary: a kernel
-   security update installs but does not take effect until reboot, so "updates
-   are automatic" is only half true without it.
-
-   **Decide first:** the Telegram bot token is a secret and `.gitignore` blocks
-   `.env*`. It has to reach the script from outside the repo — argument,
-   environment variable, or a file mode 0600 that is never committed. First time
-   this artifact touches secrets; worth doing deliberately.
-
-2. **Clean machine.** LXD is installed on the Pi but not initialised
-   (`lxd init` still to run). Check early whether `ufw` behaves inside an
-   unprivileged container — netfilter in a network namespace may conflict with
-   the LXD bridge. If it does, fall back to an LXD VM or a throwaway VPS.
-
-3. **Run twice.** The second run must print `changes applied: 0`. This single
-   line is the only real proof of idempotency — it is what caught the earlier
-   `0644` vs `644` mode-comparison bug, which was invisible on a first run.
-
-4. **Break it.** Interrupt mid-run and record what state the machine is left in.
-   Check the traps in the real launch context rather than an interactive shell:
-   a shell started with SIGINT already ignored cannot trap it, and nothing warns
-   you.
-
-5. **README + this write-up.** README needs what it does, how to run it, its
-   assumptions, and what it deliberately does not do. Two entries for that last
-   section are already established: it does not reboot after a kernel upgrade
-   (availability is the owner's call, not the script's), and it is not how this
-   is done in practice — cloud-init and Ansible are, and this exists to show the
-   mechanics they wrap.
+- **`20auto-upgrades` was already byte-identical on the stock image.** The
+  postinst had generated it from the debconf default. So the write is redundant
+  on stock Ubuntu and load-bearing only where an image builder preseeded
+  `enable_auto_updates` to false. That also answers the `dpkg-reconfigure -plow
+  unattended-upgrades` question: it is the interactive front door to the same
+  file, not a different mechanism.
+- **`/proc/meminfo` and `/proc/loadavg` inside the container described the host.**
+  `lab-monitor` reported 899 MiB total and a load of 1.96 on 4 cores — those are
+  the Pi's numbers, not the container's. Monitoring from inside a container
+  measures the wrong machine unless the tool reads cgroup limits.
+- **The dry-run's own arithmetic is the proof it changed nothing.** It predicted
+  10 changes; the real run that followed applied exactly 10. Had the dry-run
+  leaked a single change, the second number would have been smaller.
 
 ## Open questions
 
-- Does `ufw` work correctly inside an unprivileged LXD container? Decides
-  whether the clean-machine test can happen on the Pi at all.
-- Should the monitoring summary go to the journal, a file, or both? The journal
-  is queryable (`journalctl -u`) and rotates itself; a file is easier to `tail`
-  but needs its own rotation.
-- `bats` is still not installed anywhere. The `main "$@"` call is already
-  guarded by `BASH_SOURCE` so the file can be sourced without configuring the
-  machine, but no tests exist yet.
+- The both-units-enabled path is **written but not run**. Fixing it correctly
+  would mean running the bootstrap against the Pi itself and moving the port on
+  the machine this whole lab is reached through — not something to do casually,
+  and not something to claim without doing. The container only proves the
+  socket-only case.
+- The script never reverts: moving a machine back from `ssh.socket` to
+  `ssh.service`, or back to port 22, leaves the drop-ins in place. Removal is a
+  separate mode and it is not written.
+- `verify` does not assert that port 22 **stopped** listening after the move. It
+  is deliberate — 22 is left open in the firewall so the move cannot lock anyone
+  out — but "the old door is closed" is currently unchecked.
+- `bats` is still not installed anywhere. `main "$@"` is guarded by
+  `BASH_SOURCE` so the file can be sourced without configuring the machine, but
+  no tests exist.
