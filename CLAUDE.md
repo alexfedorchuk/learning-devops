@@ -54,12 +54,14 @@ source of truth for content — it is the **scope ceiling**:
 
 ## Retention: spaced retrieval and cheat sheets
 
-Two practices borrowed deliberately from the `teach` skill (adopted 2026-08-05) without
-its workspace:
+Practices borrowed deliberately from the `teach` skill (first adopted 2026-08-05)
+without its workspace:
 
 - **Opening re-quiz.** Every day starts with ~3 checkpoint questions from *previous*
   days, answered aloud from memory before any new material. Five minutes, no more —
-  the goal is spaced retrieval, not a second lesson. Pick questions 2–4 days old.
+  the goal is spaced retrieval, not a second lesson. Pick questions 2–4 days old, and
+  from week 3 on **interleave** — one question from the current topic area, one from a
+  distant one. Mixing domains retains better than drilling a single one.
 - **Weekly cheat sheet.** Closing a week produces one compact English reference in
   `<week-block>/reference/` — the compressed essence of that week (commands, states,
   patterns), designed to be reread weeks later. `NOTES.md` records what
@@ -73,6 +75,18 @@ A third reference serves a different need (added 2026-08-25):
   ("disk is full", "writing a bash script"), never chronologically, so finding
   something never requires remembering which week taught it. Append to it as days
   land; keep entries terse and include the traps that make a command silently wrong.
+
+A fourth, `GLOSSARY.md`, closes the last gap (added 2026-08-31):
+
+- **Glossary**, at the repository root — deliberately not per week-block, since terms
+  recur across blocks and only a single file catches collisions (LVM's `PV` against
+  Kubernetes' `PersistentVolume` being the one already in sight). It answers "what does
+  X *mean*", where `commands.md` answers "how do I do X" and the cheat sheets answer
+  "how does X *work*". Entries are one or two sentences defining what the term **is**,
+  with an `_Avoid_` line naming the loose synonyms it replaces; that line does double
+  duty on the English track. A term is added once it can be used correctly, not when it
+  is first met, and entries stay at the depth the curriculum reached — anything a day
+  parked in `Open questions` stays parked.
 
 ## Conventions that matter
 
@@ -115,5 +129,6 @@ Invoking `/teach` turns the working directory into a stateful teaching workspace
 own files (`MISSION.md`, `RESOURCES.md`, `learning-records/`, `lessons/`, `reference/`,
 `assets/`). None exist yet. **Decision (2026-08-05): the full workspace is deliberately
 not used** — `MISSION.md`/`learning-records/`/`lessons/` would duplicate the
-curriculum/day-notes flow above. Only two of its ideas are adopted (see "Retention"):
-the opening re-quiz and weekly cheat sheets. Do not create the other teach files.
+curriculum/day-notes flow above. Three of its ideas are adopted (see "Retention"): the
+opening re-quiz, weekly cheat sheets, and `GLOSSARY.md`. Do not create the other teach
+files.
