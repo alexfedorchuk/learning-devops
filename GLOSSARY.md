@@ -181,3 +181,62 @@ The route matching every destination, written `0.0.0.0/0` or `default`, used whe
 more specific matches. It is chosen last not because of a flag but because zero fixed bits
 is the shortest possible prefix, and routing lookup takes the longest match.
 _Avoid_: Gateway, catch-all route
+
+**Socket**:
+A kernel object representing one endpoint of a communication, addressed by a file
+descriptor and therefore subject to every rule that governs descriptors — inherited
+across `fork()`, counted against `ulimit -n`, closed only by the owning process. A
+listening socket holds one half of an address pair; each accepted connection becomes a
+separate socket of its own.
+_Avoid_: Port, connection, channel
+
+**Four-tuple**:
+The four values that identify a TCP or UDP connection to the kernel — source address,
+source port, destination address, destination port — which is why one server port can
+carry tens of thousands of simultaneous connections: uniqueness comes from the client's
+half. A port is an address to reach, never an identifier of a connection.
+_Avoid_: Connection ID, socket pair, port
+
+**Ephemeral port**:
+The source port a kernel allocates from a free pool when a client connects without
+naming one. The pool is an operating-system choice, not part of the protocol — Linux
+uses 32768–60999 (`net.ipv4.ip_local_port_range`), macOS 49152–65535 — and exhausting it
+limits how many connections *one client* can hold to *one* server address and port.
+_Avoid_: Random port, high port, client port
+
+**Backlog**:
+The ceiling on how many fully established connections the kernel will hold for a
+listening socket while waiting for the application to call `accept()`, shown as `Send-Q`
+in `ss` on a `LISTEN` row and capped by `net.core.somaxconn`. A backlog that fills means
+the application is too slow to accept, and new clients are refused.
+_Avoid_: Queue, connection limit, somaxconn
+
+**MTU (Maximum Transmission Unit)**:
+The largest packet a given link will carry, 1500 bytes on ordinary Ethernet. It is a
+property of one link, not of a path, so neither end of a connection knows the smallest
+MTU between them; discovering it depends on routers returning ICMP `fragmentation
+needed`, and a firewall that blocks that ICMP turns the mismatch into silent loss of
+full-sized packets only.
+_Avoid_: Packet size, frame size
+
+**MSS (Maximum Segment Size)**:
+The largest payload a TCP sender will put in one segment, announced by each side in its
+SYN and derived from its **own** first link's [[mtu-maximum-transmission-unit]] — 1460
+from a 1500-byte MTU, less 20 bytes of IP and 20 of TCP header. The usable figure drops
+further by the size of the options carried on every packet, which is why timestamps
+reduce it to 1448.
+_Avoid_: Payload size, window
+
+**TIME_WAIT**:
+The state held for 60 seconds by the side that closed a connection **first**, so that a
+lost final ACK can still be answered and so stale packets of the old connection cannot
+be delivered into a new one reusing the same [[four-tuple]]. It expires on a kernel
+timer and is a picture of load, not a fault.
+_Avoid_: Leak, stuck connection, lingering socket
+
+**CLOSE_WAIT**:
+The state of a socket whose peer has sent FIN and whose own application has not yet
+called `close()`. The kernel has no timer for it and never can — the application still
+holds the right to write — so an accumulation is always an application defect and always
+a file-descriptor leak, cleared only when the process closes the socket or dies.
+_Avoid_: Hung connection, network problem, stale socket

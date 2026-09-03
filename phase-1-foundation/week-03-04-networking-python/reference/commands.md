@@ -109,3 +109,125 @@ there isn't answering.**
 `ping google.com` still resolved — the resolver is a neighbour, reachable over the surviving
 `scope link` route — and only then failed at `connect()`. "DNS works" is a routine reason to
 wrongly cross the network off the suspect list.
+
+## What is listening on this machine
+
+```bash
+sudo ss -tulpn      # t=tcp u=udp l=listening p=process n=numeric  <- always with sudo
+sudo ss -tulpn | grep -v 127.0.0                 # only what is reachable from outside
+sudo ss -s                                       # totals per protocol, incl. timewait
+```
+
+**Without `sudo` the Process column is silently empty**, not an error — `-p` has to read
+other processes' `/proc/<pid>/fd/`.
+
+**Read the bind address before the port.** `0.0.0.0:5432` is a database on the internet;
+`127.0.0.1:5432` cannot be reached from the network at all, whatever the firewall says.
+`%eth0` on an address means bound to that interface as well.
+
+`LISTEN` rows: `Send-Q` is the accept-queue ceiling (`net.core.somaxconn`), `Recv-Q` is how
+many completed connections are waiting for `accept()`. Same columns on an `ESTAB` row mean
+bytes — unread by the app, and sent-but-unacked. Different question per state.
+
+Two processes on one socket is normal: `sshd` + `systemd` on a listener means socket
+activation; two `sshd` on a connection means privilege separation.
+
+## Who is connected, and in what state
+
+```bash
+sudo ss -tnp state established
+sudo ss -tanp state close-wait                   # <- names the leaking process directly
+ss -tan state time-wait | wc -l
+ss -tan '( sport = :9000 or dport = :9000 )'     # both sides, when both are local
+```
+
+| State | Means | Verdict |
+|---|---|---|
+| `TIME_WAIT` | this side closed **first**; 60 s kernel timer | normal, self-clearing |
+| `CLOSE_WAIT` | peer sent FIN, **our app never called `close()`** | application bug, fd leak |
+| `FIN_WAIT_2` | we closed, waiting for peer's FIN | clears via `tcp_fin_timeout` only once orphaned |
+| `SYN_SENT` (hanging) | SYN sent, nothing came back | problem on the path |
+
+**`CLOSE_WAIT` has no timer and never will** — the kernel cannot close a socket the
+application may still write to. That is why it accumulates and `TIME_WAIT` does not.
+Restarting the service "fixes" it, which is why the bug survives for years.
+
+Confirm the culprit the day-2 way: `ls -l /proc/<pid>/fd` shows `N -> socket:[inode]`.
+
+## Is it the network or the application
+
+```bash
+sudo ss -tinp state established
+```
+
+| Field | Read it as |
+|---|---|
+| `app_limited` | **the application is the limit, not the network** — stop looking at the wire |
+| `cwnd:10` | still the Linux initial window; small alone proves nothing |
+| `retrans:` present | real loss on the path |
+| `rtt:a/b` | smoothed / mdev — includes delayed ACKs (`ato:`) |
+| `minrtt:` | the honest wire number, use this one |
+| `rto:` | never below 200 ms (`TCP_RTO_MIN`), whatever the RTT |
+| `pmtu:` | kernel's current belief about path MTU — first field when a hang smells like MTU |
+| `mss:` vs `advmss:` | in use vs announced; 1448 vs 1460 = 12 bytes of timestamps per packet |
+| `snd_wnd:` | peer's window, already multiplied by `wscale` |
+
+`bytes_sent == bytes_acked` exactly means nothing is in flight.
+
+## Watching a connection start and finish
+
+```bash
+sudo tcpdump -nn -i eth0 'tcp port 22 and tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0'
+sudo tcpdump -nn -i eth0 'host 192.168.0.193 and (tcp port 9000 or icmp)'
+```
+
+**The flag filter hides pure ACKs** — the third packet of the handshake and the last of
+the teardown vanish, so seven packets show as four. Easy to misread as an incomplete
+connection. A filter is always part of the answer.
+
+| Flags | Packet |
+|---|---|
+| `[S]` | SYN |
+| `[S.]` | SYN-ACK (`.` is ACK) |
+| `[.]` | pure ACK |
+| `[F.]` | FIN |
+| `[R.]` | RST |
+| `E`, `W` | ECN negotiation, not an error |
+
+`ack` = peer's `seq` + 1 on a `length 0` SYN because **SYN consumes a sequence number**.
+FIN does too. Sequence numbers go relative once tcpdump has seen the handshake.
+
+`mss`, `wscale`, `sackOK`, `TS` appear **only in the SYN** and can never be renegotiated.
+A middlebox stripping SYN options leaves a working connection permanently capped at 64 KB.
+
+## Is the port reachable — and is there a firewall
+
+```bash
+time nc -v -w 20 <host> <port>      # measure it, the duration is the diagnosis
+```
+
+| On the wire | Client sees | What it is |
+|---|---|---|
+| SYN-ACK | success | open, listener present |
+| RST | `Connection refused` | port closed **or** a firewall rejecting — indistinguishable |
+| nothing, repeated SYNs | timeout | DROP, wrong route, or host down |
+
+**The split is answer vs silence, not three symptoms.** An answer proves the host is alive
+and something refused actively; *what* refused cannot be told from the client. Silence
+means something swallows the packet.
+
+`ufw reject <port>/tcp` sends a **RST, not ICMP** — ufw overrides the iptables default
+(`common.py`: `# follow TCP's default and send RST`). `ufw reject <port>/udp` still gives
+ICMP port unreachable. `ufw deny` is DROP.
+
+An ICMP `port unreachable` whose **source address differs from the destination** proves a
+middlebox firewall you did not know about. `nc` shows `Connection refused` either way;
+only the capture distinguishes them.
+
+Repeated identical SYNs with no reply is the signature of DROP. Retry pattern is the
+client OS's, not the network's: Linux backs off 1,2,4,8,16,32 and gives up near 127 s
+(`tcp_syn_retries=6`); macOS starts flat at 1 s.
+
+**Timing measures the client, not the path.** A RST arriving in 0.2 ms was reported by
+macOS `nc` after 1.02 s, because it re-sent the SYN once first. And `nc -w` on macOS does
+not apply to `connect()` — a DROPped port hangs past the stated timeout.
