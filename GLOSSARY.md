@@ -240,3 +240,57 @@ called `close()`. The kernel has no timer for it and never can — the applicati
 holds the right to write — so an accumulation is always an application defect and always
 a file-descriptor leak, cleared only when the process closes the socket or dies.
 _Avoid_: Hung connection, network problem, stale socket
+
+**Zone**:
+The administrative unit of DNS: the set of records one server is authoritative for, marked
+at its top by an `SOA` record and **ending wherever a delegation begins**. A domain is a
+name in the tree; a zone is who answers for part of it, so one domain may be several zones.
+_Avoid_: Domain, DNS entry, namespace
+
+**Delegation**:
+Handing responsibility for a subtree of the name space to another set of nameservers, done
+with `NS` records that exist in two places at once — in the parent as a pointer and at the
+child's apex as an authoritative claim. Resolution is a chain of these referrals rather
+than a search, which is why no server needs to know a name exists except the one pointing
+directly at it.
+_Avoid_: Pointing, forwarding, redirect
+
+**Authoritative server**:
+A server holding a [[zone]] and answering only about it, never querying anyone else. Its
+replies carry the `aa` flag, which is what separates a source from a relay, and it offers
+no recursion — so `dig`'s "recursion requested but not available" against one is normal.
+_Avoid_: DNS server, nameserver (when a recursive resolver is meant), master
+
+**Recursive resolver**:
+The server that performs the whole walk from the root on a client's behalf and **caches**
+what it learns — `1.1.1.1`, `8.8.8.8`, an ISP's or a router's. It is not one machine: a
+public one is anycast across sites, each running many instances with independent caches, so
+a single query can never confirm what "the resolver" is serving.
+_Avoid_: DNS server, nameserver, DNS provider
+
+**Stub resolver**:
+The client-side library or local service that asks one question of its configured
+[[recursive-resolver]] and takes the answer — on Ubuntu, `systemd-resolved` listening on
+`127.0.0.53`. It performs no delegation walk of its own.
+_Avoid_: Client, local DNS, resolver
+
+**TTL (Time To Live)**:
+The number of seconds a record may be cached, published by the zone that owns it. It is a
+**ceiling, not a floor**: a cache must not exceed it and may discard sooner, and there is no
+mechanism anywhere to make a cache forget early. The value that governs a cached record is
+the one in force when it was fetched, not whatever is published afterwards.
+_Avoid_: Expiry, cache time, refresh interval
+
+**Negative caching**:
+Caching the *absence* of a name. An `NXDOMAIN` is proved by returning the zone's `SOA`
+rather than an answer, and the `SOA`'s last field sets how long that non-existence may be
+remembered (1800 s on Cloudflare) — which is why a freshly created record can fail for
+reasons that have nothing to do with the record.
+_Avoid_: NXDOMAIN cache, failed lookup cache
+
+**Anycast**:
+Announcing one address from many locations so routing delivers each client to the nearest.
+The root servers, TLD servers and public resolvers all use it, which is why the same address
+answers with different latencies, different instance identifiers (`dig +nsid`) and different
+cache contents depending on where the query entered the network.
+_Avoid_: Load balancing, CDN, round-robin

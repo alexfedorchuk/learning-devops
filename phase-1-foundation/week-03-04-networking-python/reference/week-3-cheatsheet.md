@@ -346,3 +346,196 @@ Two owners on one socket is normal and means two different things: `sshd` + `sys
 listener is socket activation (systemd opened the port and passed the fd in, so the port
 survives a service restart); two `sshd` on a connection is privilege separation, the
 unprivileged child having inherited the descriptor across `fork()`.
+
+## DNS (day 15)
+
+
+### Resolution is delegation, not lookup
+
+There is no database being searched. There is a chain of referrals, and at every step the
+answer is "ask those people instead".
+
+A resolver seeing `lab.airscroll.net` for the first time asks a root server. The root does
+not know the address and does not know what `airscroll.net` is. It knows one thing: who is
+authoritative for `net`. It returns that — a referral, not an answer. The `net` servers
+likewise return who holds `airscroll.net`. Only the third server asked is **authoritative**
+and gives a real answer.
+
+This is why DNS scales: no server holds more than its own branch of the tree, and nobody
+needs to know a domain exists except whoever points at it directly.
+
+### Three roles, worth not confusing
+
+| Role | Does | Asks anyone? |
+|---|---|---|
+| **Authoritative server** | holds a zone, answers only about it | never |
+| **Recursive resolver** | walks from the root, **caches** the result | yes, everyone |
+| **Stub resolver** | the library on your machine: one question, one answer | its resolver only |
+
+`dig +trace` imitates the recursive resolver — it walks from the root itself and prints
+every referral. A plain `dig` is the stub's view: one question, one answer, the walk done
+by somebody else and most likely done long ago and served from cache. That difference is
+the whole reason `+trace` is the tool for "why does this resolve differently over there".
+
+### A zone is not a domain
+
+A **domain** is a name in the tree, with everything under it. A **zone** is an
+administrative unit — the records one server is authoritative for — and it **ends where a
+delegation begins**.
+
+Delegate `lab.airscroll.net` to another nameserver and it becomes its own zone, leaving the
+parent's. The domain `airscroll.net` still contains the whole subtree; one branch is simply
+served elsewhere. So one domain can be many zones, and the boundary between them is an `NS`
+record.
+
+### Records
+
+**`SOA`** — the presence of this record *is* the definition of "a zone starts here". Holds
+the primary nameserver, the admin's email (with `@` written as a dot, a historical
+oddity), a serial, and timers. Its **last field is the TTL for negative answers**, which
+matters more than it looks.
+
+**`NS`** — delegation, and it always exists in **two places**: in the parent zone as a
+pointer ("not me from here down") and at the child zone's apex as an authoritative
+statement ("this is me"). A mismatch between the two copies is a classic cause of "it
+resolves for some people and not others".
+
+**`A`** / **`AAAA`** — name to address, v4 and v6.
+
+**`CNAME`** — name to **another name**, never to an address. Hard rule: if a name has a
+CNAME it may have **no other record at all**. This is a protocol requirement, not a
+convention.
+
+**Why a CNAME cannot sit at the apex** follows from that rule and nothing else. A zone apex
+is *required* to carry `SOA` and `NS` — otherwise it is not a zone. A CNAME demands that
+nothing else exists. Two requirements that cannot both hold. Not a ban somebody invented;
+arithmetic on the rules. (Providers offering "CNAME flattening" or `ALIAS` at the apex are
+resolving the CNAME themselves and publishing the resulting `A` — the protocol is unchanged.)
+
+**`MX`** — where mail goes, with a priority. Points at a **name**, never an address and
+never a CNAME.
+
+**`TXT`** — arbitrary text; SPF, DKIM and every domain-ownership proof live here.
+
+**`CAA`** — which certificate authorities are **permitted** to issue certificates for this
+name; CAs are obliged to check it before issuing. Note what kind of record that is: it does
+nothing to help you get a certificate, it stops **somebody else** getting one for your name
+through a different CA. A prohibition, not a capability.
+
+### TTL is a promise to caches, and there is no undo
+
+A TTL tells every resolver how many seconds it may keep an answer. Once one has taken it,
+**there is no way to reach into that cache** — no API, no command, nothing. The record
+lives exactly as long as was promised, in every resolver in the world, each running its own
+timer from the moment it happened to ask.
+
+Hence the only correct migration procedure: **lower the TTL a day before the switch**, not
+at the switch. The reasoning is not obvious until said aloud — for a new low TTL to take
+effect, the **old high one must expire first**. Lower it at the same moment the address
+changes and every resolver that cached yesterday keeps serving the old address, with the
+old TTL, for the full old duration. Nothing was accelerated.
+
+**Negative answers are cached too.** `NXDOMAIN` is held for the time in the `SOA`'s last
+field (1800 s on Cloudflare). So a freshly created record can fail to work not because it
+is wrong but because a resolver remembers, correctly, that the name did not exist when it
+asked. This is exactly the moment people start blindly re-creating a record that was right
+the first time.
+
+### Ubuntu: why `dig` and `resolvectl` honestly disagree
+
+`/etc/resolv.conf` is a **symlink you do not own**, generated by `systemd-resolved` and
+containing one server: `127.0.0.53`. Editing it by hand achieves nothing; it is rewritten.
+
+The two listeners on port 53 seen on day 14 differ like this: `127.0.0.53` is the **stub
+resolver** and applies all of resolved's logic — per-link DNS, domain routing, split-DNS —
+while `127.0.0.54` is a bypass that forwards upstream without it.
+
+So `dig` sends an ordinary DNS packet to `127.0.0.53`, while `resolvectl query` goes
+through resolved's own API and applies things a DNS packet cannot express. When the two
+disagree it is not a bug: they are two different questions.
+
+### A TTL says where the answer came from
+
+Round, full TTLs come **fresh from an authoritative server**. Odd, decreasing numbers are
+the remainder of somebody's cache entry. One `dig +trace` shows both at once — the root
+`NS` list arriving from the local resolver with a worn-down TTL, the `net` delegation
+arriving from the root with a full 172800.
+
+Free, always present, no extra command. Use it before believing any answer is current.
+
+### "A resolver" is not one cache
+
+`8.8.8.8` is anycast to many sites, and each site runs many resolver instances with
+**independent caches**. `dig +nsid` shows which one answered:
+
+```
+NSID: gpdns-bud   TTL 300      <- cold instance, fetched fresh
+NSID: gpdns-prg   TTL 300      <- different site entirely
+NSID: gpdns-bud   TTL 181
+NSID: gpdns-bud   TTL 289      <- TTL went UP: same label, different machine
+```
+
+A TTL rising between two consecutive queries to one address is proof of multiple caches,
+not a bug — time does not run backwards.
+
+Three consequences that matter more than the mechanism:
+
+- **One query cannot verify a DNS change.** "It works now" is one instance out of an
+  unknown number. Sample: `for i in $(seq 1 20); do dig +short <name> @8.8.8.8; done | sort | uniq -c`.
+- **Two users of the same public resolver can see different answers at the same moment**,
+  and neither is wrong.
+- "Flush your DNS" aimed at a public resolver is close to meaningless; there is no way to
+  address one instance.
+
+A TTL is a **ceiling, not a floor**: a resolver must not exceed it, and may discard an
+entry sooner under memory pressure. Never build on a cache forgetting early.
+
+### The rollback that helps nobody
+
+Measured, not theorised. A record at TTL 86400, warmed, then changed to a bad address:
+
+```
+authoritative:  192.0.2.1
+8.8.8.8 x15:    13 x old      2 x new       <- two worlds, simultaneously
+```
+
+Then the standard incident reflex — restore the content, drop the TTL to 300:
+
+```
+authoritative:  178.151.120.5
+8.8.8.8 x20:    18 x good     2 x 192.0.2.1  <- still broken, for up to 24 hours
+```
+
+The eighteen were never broken. The two that took the bad value keep it for the full
+original TTL, because **the TTL that matters is the one in force when the record was
+cached, not the one set afterwards**. Lowering it during an incident helps only the *next*
+incident — which is exactly why the procedure is to lower it a day ahead. During the
+outage the lever is not connected to anything.
+
+Note the shape of the resulting failure: a minority of users cannot reach the service,
+everyone else is fine, monitoring is green, and it cannot be reproduced from the operator's
+side. Worse to diagnose than a total outage.
+
+"DNS propagation" is a misleading term. Nothing propagates. Each cache independently runs
+out its own timer.
+
+### Reading the delegation in practice
+
+- Parent and child both carry the zone's `NS` records, and **their TTLs may legitimately
+  differ** (172800 from the `.net` registry, 86400 from Cloudflare). Each zone sets TTLs
+  for its own records. Only a mismatch in **names** breaks resolution.
+- **No glue for out-of-zone nameservers.** `elma.ns.cloudflare.com` gets no address in the
+  `.net` referral because it lives in another zone and can be resolved normally. Glue is
+  needed only when a zone's nameserver lives inside that same zone, which would otherwise
+  be circular.
+- **`aa` separates a source from a relay.** Cloudflare's answers carry it, a public
+  resolver's do not. `dig` always prints it, which is one reason to prefer it to
+  `nslookup`.
+- **`WARNING: recursion requested but not available` is normal.** `dig` sets `rd` by
+  default; an authoritative server never offers recursion. The role difference, printed.
+- The EDNS buffer differs by server — 1232 from Cloudflare against 512 from Google. 1232 is
+  the DNS flag day 2020 value, picked so a response fits the smallest realistic MTU without
+  fragmenting. Day 14's PMTUD black hole was painful enough to move a protocol constant.
+- Nameservers are anycast, and even their addresses vary between runs.
+- A typo in `@server` gives `couldn't get address for ...` — a different **class** of
+  failure: the query was never asked, because the server's own name would not resolve.

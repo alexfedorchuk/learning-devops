@@ -231,3 +231,106 @@ client OS's, not the network's: Linux backs off 1,2,4,8,16,32 and gives up near 
 **Timing measures the client, not the path.** A RST arriving in 0.2 ms was reported by
 macOS `nc` after 1.02 s, because it re-sent the SYN once first. And `nc -w` on macOS does
 not apply to `connect()` — a DROPped port hangs past the stated timeout.
+
+## What does this name resolve to, and who says so
+
+```bash
+dig <name> +short                       # just the answer
+dig <name>                              # status, flags, TTLs — read these, not just the address
+dig <name> @1.1.1.1                     # ask a specific resolver, bypassing your own cache
+dig <name> @<authoritative-ns>          # ask the source; the only current answer
+dig <name> +trace                       # walk the delegation from the root yourself
+dig <name> +nsid @8.8.8.8               # which instance of that resolver answered
+```
+
+Use `dig`, not `nslookup` — `nslookup` shows less and misreports authoritativeness.
+
+| In the header | Means |
+|---|---|
+| `status: NOERROR` + ANSWER section | resolved |
+| `status: NXDOMAIN` + `SOA` in AUTHORITY | the name does not exist; the `SOA` **is** the proof, and carries the negative TTL |
+| `flags: ... aa` | authoritative — the source, not a relay |
+| no `aa` | a cached or relayed answer |
+| `WARNING: recursion requested but not available` | normal when asking an authoritative server |
+| `couldn't get address for '<ns>'` | the **server's own name** would not resolve — your query was never sent |
+
+**A TTL says where the answer came from.** Round full numbers = fresh from authoritative;
+odd decreasing numbers = the remainder of a cache entry. Visible in every output, costs
+nothing.
+
+`SOA` fields, left to right: primary NS, admin email (`@` written as a dot), serial,
+refresh, retry, expire, **negative-cache TTL** — the last one is how long `NXDOMAIN` may be
+remembered (1800 on Cloudflare).
+
+## Why does it resolve differently over there
+
+```bash
+for i in $(seq 1 20); do dig +short <name> @8.8.8.8; done | sort | uniq -c
+dig <name> +nsid @8.8.8.8 | grep NSID
+dig <zone> NS @<parent-tld-server>      # parent's copy of the delegation
+dig <zone> NS @<child-ns>               # child's own copy
+```
+
+**One query proves nothing.** A public resolver is anycast across sites and each site runs
+many instances with independent caches — a rising TTL between two queries to the same
+address proves it. Sample and count instead.
+
+Parent and child `NS` copies must match in **names**; differing TTLs are normal and
+harmless (each zone sets its own).
+
+Two users of one public resolver can see different answers simultaneously and both be
+right. "Flush your DNS" against a public resolver is close to meaningless.
+
+## Changing a DNS record without hurting anyone
+
+```bash
+# Cloudflare, token scoped Zone:DNS:Edit on ONE zone
+read -rsp 'CF token: ' CF_TOKEN; echo; export CF_TOKEN     # keeps it out of ~/.bash_history
+
+ZONE_ID=$(curl -s -H "Authorization: Bearer $CF_TOKEN" \
+  'https://api.cloudflare.com/client/v4/zones?name=<zone>' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"][0]["id"])')
+
+curl -s -X POST -H "Authorization: Bearer $CF_TOKEN" -H 'Content-Type: application/json' \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  --data '{"type":"A","name":"lab","content":"<ip>","ttl":300,"proxied":false}'
+```
+
+`"name":"lab"` — the short label; Cloudflare appends the zone. Writing the full name
+produces `lab.<zone>.<zone>`.
+
+**`"proxied": false` matters.** Left true, DNS returns Cloudflare's addresses instead of
+yours and every TLS and reachability test afterwards measures the wrong thing.
+
+**Lower the TTL a day BEFORE a migration, never during.** For a new low TTL to apply, the
+old high one must expire first. The TTL that governs a cached bad record is the one in
+force when it was **fetched** — changing it afterwards helps nobody already affected, only
+the next incident.
+
+Break-it on a **throwaway name**, never on the one needed tomorrow: the exercise burns that
+name for the length of its TTL, and deleting the record does not touch caches that hold it.
+
+An `A` record must point at an address reachable from the internet. An RFC1918 address
+(`10/8`, `172.16/12`, `192.168/16`) is dropped by every backbone router. Check for an ISP
+NAT before planning a port forward: compare the router's WAN address with
+`dig +short myip.opendns.com @resolver1.opendns.com` — if the WAN address is private, there
+is a NAT in front that you do not control and forwarding a port cannot work.
+
+## DNS on Ubuntu is systemd-resolved
+
+```bash
+ls -l /etc/resolv.conf          # a symlink you do not own — editing it achieves nothing
+resolvectl status               # per-link servers, search domains, DNSSEC state
+resolvectl query <name>         # resolved's own API: says which link answered
+resolvectl flush-caches
+```
+
+`dig` sends an ordinary packet to `127.0.0.53`; `resolvectl query` goes through resolved's
+API and applies per-link DNS and split-DNS that a plain packet cannot express. When they
+disagree, they are answering different questions.
+
+`127.0.0.53` is the stub with all of resolved's routing logic; `127.0.0.54` is a bypass
+that forwards upstream without it.
+
+Watch for `DNS Domain:` in `resolvectl status` — a search domain from DHCP, silently
+appended to unqualified names, and a good source of baffling lookups.

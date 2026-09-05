@@ -11,7 +11,7 @@ build, no package manager, no test suite. The unit of work is a **day** (notes) 
 
 Work is done against a physical lab, not a sandbox:
 
-- Lab server: Raspberry Pi 3B, Ubuntu Server 24.04 LTS (arm64), domain `lab.airscroll.app`
+- Lab server: Raspberry Pi 3B, Ubuntu Server 24.04 LTS (arm64), domain `lab.airscroll.net`
 - Workstation: macOS, Apple Silicon
 
 Scripts written here target **Ubuntu arm64**, not the workstation. macOS ships bash 3.2

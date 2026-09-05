@@ -29,7 +29,7 @@ the failures, and are not meant to be revisited for reference.
 | Component | What it is |
 |---|---|
 | Lab server | Raspberry Pi, Ubuntu Server LTS (arm64) |
-| Domain | `lab.airscroll.app` (subdomain of a production product) |
+| Domain | `lab.airscroll.net` (subdomain of a production product) |
 | Workstation | macOS, Apple Silicon |
 
 ## Structure

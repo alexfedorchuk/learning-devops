@@ -171,17 +171,36 @@ got the packet lost.
 
 ## Checkpoint answers
 
-**Not done — the day was cut short before the checkpoint.** The break-it exercise ran in
-full; the checkpoint questions were not answered aloud, so by this repository's own bar
-day 14 is not formally closed. They are the first item of day 15, before its re-quiz:
+Answered at the opening of day 15 rather than at the end of day 14 — the day was cut
+short. Two correct, one partial, one forgotten, and the forgotten one is exactly the
+topic that never got practised.
 
-- `Connection refused` vs a timeout — what does each mean and what do you check first?
-- A server holds 40 000 connections on port 443. How does one port carry that?
-- Thousands of `CLOSE_WAIT` on a server — network problem or application problem, and why?
-- Why does an HTTP request for a small page succeed while a large one hangs?
+1. `Connection refused` vs a timeout. **Partial.** The refused half was right and for the
+   right reason: an answer came back, so the host is alive and the path works, and the
+   next step is on the host itself (`ss -tulpn`, then its firewall rules) because a RST
+   from the kernel and a RST from a firewall are indistinguishable from the client. The
+   timeout half was missing: silence means the packet is being swallowed and the level is
+   still unknown — DROP, a wrong route, or a dead machine — so what gets checked is the
+   path (`ip route get`, then a capture on the host to see whether the SYN arrives at
+   all), not the ports.
+2. How one port carries 40 000 connections. **Correct.** The four-tuple. Worth finishing
+   the sentence: uniqueness comes from the *client's* half, and a server's ceiling is file
+   descriptors (`ulimit -n`), not ports.
+3. Thousands of `CLOSE_WAIT` — network or application. **Correct**, with the mechanism and
+   the reason there is no timer. Nothing to add.
+4. Small page passes, large page hangs. **Forgotten.** Only "something to do with 1500"
+   survived. Reconstructed: each side computes its `MSS` from its own first link
+   (1500 − 20 − 20 = 1460) and knows nothing about the path; a smaller link in the middle
+   cannot fragment because TCP always sets `DF`, so the router must return ICMP
+   `fragmentation needed`, and that ICMP is the only way the sender ever learns. Block it
+   and the first full-sized segment dies silently while the handshake and the headers, all
+   small, succeed. The property that identifies it: the failure is **deterministic by
+   size**, not random in time. First field to check is `pmtu:` in `ss -tin`.
 
-Three of the four were demonstrated during the day, so the answers should be retrievable;
-the fourth (MTU) was covered in the model only.
+The one forgotten answer is the one the day never practised — `ping -M do` was planned and
+skipped. Direct evidence that the break-it exercise is what makes an answer stick: the
+three states that were reproduced by hand came back intact a day later, and the one that
+stayed theory did not.
 
 ## Open questions
 
