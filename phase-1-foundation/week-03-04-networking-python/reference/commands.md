@@ -334,3 +334,213 @@ that forwards upstream without it.
 
 Watch for `DNS Domain:` in `resolvectl status` — a search domain from DHCP, silently
 appended to unqualified names, and a good source of baffling lookups.
+
+## Getting a TLS certificate when port 80 is unreachable
+
+```bash
+# 0. before anything: may any CA issue for this name at all?
+dig CAA <name> @1.1.1.1                 # empty ANSWER + SOA in AUTHORITY = no CAA = allowed
+
+# 1. token file, never created with loose permissions
+sudo install -m 600 -o root -g root /dev/null /etc/letsencrypt/cloudflare.ini
+# contents: dns_cloudflare_api_token = <token scoped Zone:DNS:Edit on ONE zone>
+
+# 2. staging first — 5 failed validations per hour is a real limit
+sudo certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+  --dns-cloudflare-propagation-seconds 30 \
+  -d <name> --agree-tos -m <email> --no-eff-email --dry-run
+
+# 3. same command without --dry-run
+```
+
+`certonly` takes the certificate and touches no service; `--nginx` would edit the config
+for you. DNS-01 works behind any NAT because the proof goes into the zone, not to the
+machine — and it is the only way to get a wildcard.
+
+Watch the challenge from another terminal:
+
+```bash
+watch -n1 'dig +short TXT _acme-challenge.<name> @<authoritative-ns>'
+```
+
+## Which certificate file goes where
+
+```bash
+sudo grep -c "BEGIN CERTIFICATE" /etc/letsencrypt/live/<name>/{cert,chain,fullchain}.pem
+```
+
+`cert.pem` 1 (leaf only), `chain.pem` 1 (intermediate only), `fullchain.pem` 2 (both).
+**`ssl_certificate` wants `fullchain.pem`.** Using `cert.pem` is the single most common TLS
+misconfiguration: nginx starts, `nginx -t` passes, browsers work, every OpenSSL client
+fails. `chain.pem` is for `ssl_trusted_certificate` (OCSP stapling).
+
+`live/` holds symlinks into `archive/`, so the config path is stable across renewals — and
+therefore nginx keeps the **old file open** after a renewal. A deploy hook is mandatory:
+
+```bash
+sudo nano /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh   # case on $RENEWED_LINEAGE
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+sudo certbot renew --dry-run --run-deploy-hooks
+```
+
+`deploy/` runs only when a certificate actually changed; `post/` runs on every attempt
+(~180 useless reloads per renewal). Without the exec bit the hook is skipped quietly. And
+certbot reports **success for the renewal even when the hook failed** — its exit status
+means "certificate obtained", not "the server is serving it".
+
+## Is the certificate actually right — without opening a browser
+
+```bash
+# route only overridden; SNI, Host and the verified name all still come from the URL
+curl -v --resolve <name>:443:<ip> https://<name>/
+
+# what is really on the wire
+openssl s_client -connect <ip>:443 -servername <name> -showcerts </dev/null 2>&1 \
+  | grep -E "^(Verify|depth| [0-9] s:|   i:)"
+
+sudo openssl x509 -in /etc/letsencrypt/live/<name>/cert.pem -noout \
+  -subject -issuer -dates -ext subjectAltName
+```
+
+`-servername` **is** SNI; without it a multi-vhost server hands you its default certificate.
+`</dev/null` stops `s_client` waiting for you to type an HTTP request.
+
+**Run this from a machine whose TLS stack matches production.** macOS `curl` verifies
+through Security.framework — it fetches missing intermediates over `AIA` and behaves like
+Safari, so it reports success on a chain that every Linux client rejects. Verify from the
+server or a container, not from the laptop.
+
+Three failures, three layers:
+
+| Symptom | Meaning |
+|---|---|
+| `curl: (28)` timeout | packet dropped — firewall `DROP`, or never arrived |
+| `curl: (7)` connection refused, instant | RST — host reached, **nothing listening** |
+| `curl: (60)` unable to get local issuer certificate | chain incomplete — intermediate missing |
+
+An instant refusal is an answer; a slow failure is silence.
+
+A chain failure writes **nothing to `access.log`** — the handshake dies before any request.
+"Service unreachable but the access log is silent" points at TLS, not at the application:
+
+```bash
+sudo tail /var/log/nginx/error.log
+```
+
+## nginx: what is configured vs what is loaded
+
+```bash
+sudo nginx -t                  # parse the files on disk; run before EVERY reload
+sudo nginx -T | grep <thing>   # dump what the running config actually resolves to
+ls -l /etc/nginx/sites-enabled/  # symlink, or a stale copy you are not editing?
+sudo systemctl reload nginx    # old workers finish their connections; restart drops them
+```
+
+When an edit appears to do nothing, `-T` beats `-t`, and the wire beats both.
+
+`http2 on;` exists from nginx **1.25.1**; on 1.24 (Ubuntu 24.04) it is
+`listen 443 ssl http2;` and anything else is `unknown directive`. Examples online rarely say
+which branch they target.
+
+Proxying without these headers gives the application `127.0.0.1` as every client, and
+absolute URLs pointing at itself:
+
+```nginx
+proxy_set_header Host              $host;
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;   # without it: infinite redirect loops
+```
+
+Clients can send `X-Forwarded-For` too — trust it only from your own proxy.
+
+## An edit that works by hand but not in a script
+
+```bash
+cat -A file        # $ is LF, ^M$ is CRLF, trailing blanks become visible
+```
+
+A `\` continuing a shell command must be the **last** character on the line: `\` followed by
+a space escapes the space, the newline stays live, and the remaining lines run as separate
+commands. Exit `127` with `not found` means the file is absent **or** its shebang names a
+missing interpreter — `/bin/sh\r` after a CRLF save looks exactly the same. `126` with
+`Permission denied` would be the missing exec bit instead.
+
+`/etc/letsencrypt/live` and `archive` are `0700 root:root` because the private key lives
+there, so `cd` fails — and `sudo cd` cannot exist, `cd` being a shell builtin. Use absolute
+paths.
+
+## Standing up an HTTPS reverse proxy from nothing
+
+Ubuntu 24.04. Order matters: certificate first, then the config that references it —
+`nginx -t` fails on a missing certificate file.
+
+```bash
+sudo apt install nginx certbot python3-certbot-dns-cloudflare
+sudo ufw allow 'Nginx Full'          # profile shipped in /etc/ufw/applications.d/nginx
+sudo ufw status                       # 80 and 443, v4 and v6
+```
+
+`ufw app list` shows `Nginx HTTP` (80), `Nginx HTTPS` (443), `Nginx Full` (both).
+A listening socket and a firewall rule are independent: `ss` proves only the first, and a
+`DROP` gives a timeout while a closed port gives an instant refusal.
+
+Then the certificate (see the DNS-01 section above), then
+`/etc/nginx/sites-available/<name>`:
+
+```nginx
+# port 80 serves nothing; it only points at HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name <name>;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;             # nginx < 1.25.1; newer: listen 443 ssl; + http2 on;
+    listen [::]:443 ssl http2;
+    server_name <name>;
+
+    ssl_certificate     /etc/letsencrypt/live/<name>/fullchain.pem;   # NOT cert.pem
+    ssl_certificate_key /etc/letsencrypt/live/<name>/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/<name> /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+sudo ss -tlnp | grep -E ':(80|443)'
+```
+
+`$request_uri` keeps path and query across the redirect; without it every deep link lands
+on `/`. `301` is cached by the browser — use `302` while still experimenting.
+
+Bind the application to `127.0.0.1` only, so the proxy is the sole entrance:
+
+```bash
+python3 -m http.server 3000 --bind 127.0.0.1     # stand-in for the real app
+```
+
+Swapping in a real application changes only `proxy_pass`. Run it under a systemd unit —
+a foreground process dies with the SSH session.
+
+With several sites on one machine, define an explicit `default_server`: a request arriving
+by IP sends **no SNI at all**, and nginx answers it with the first `server` block for that
+socket, handing over a certificate for a name nobody asked about.

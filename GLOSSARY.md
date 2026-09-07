@@ -294,3 +294,85 @@ The root servers, TLD servers and public resolvers all use it, which is why the 
 answers with different latencies, different instance identifiers (`dig +nsid`) and different
 cache contents depending on where the query entered the network.
 _Avoid_: Load balancing, CDN, round-robin
+
+### TLS and HTTP
+
+**X.509 certificate**:
+A signed statement binding a public key to one or more names, with a validity window. It is
+**public**, not a secret — it is handed to every client that connects and published in
+Certificate Transparency logs. The secret is the private key that never leaves the server.
+The format is not TLS-specific; the same structure signs code and email.
+_Avoid_: SSL certificate, security certificate, key
+
+**SAN (Subject Alternative Name)**:
+The extension listing the names a certificate is valid for. It is the **only** field
+checked — `CN` has been ignored by clients since 2017. A wildcard entry covers exactly one
+label (`*.example.com` matches `a.example.com`, not `a.b.example.com` and not
+`example.com`), and an IP address must appear as type `iPAddress`, not as a name.
+_Avoid_: CN, common name, domain field
+
+**Certificate chain**:
+Leaf → intermediate(s) → root. A server must send the leaf **and every intermediate**; the
+root must already be in the client's trust store, so sending it is useless. Assembling the
+chain (*chain building*) is client-dependent — some stacks fetch a missing intermediate via
+the leaf's `AIA` extension, OpenSSL-based ones do not — while *validating* it is uniform.
+That asymmetry is why one client accepts what another rejects.
+_Avoid_: certificate bundle, CA chain, full certificate
+
+**Trust store**:
+The set of root certificates a client considers authoritative, shipped by the OS or the
+browser. Roots are self-signed: their trust is not derived, it is a decision by whoever
+built the store. Which store is in use decides verification — on macOS, `curl` uses the
+system evaluator and behaves like Safari; on Linux it reads a static bundle.
+_Avoid_: CA bundle, root certs, certificate authority
+
+**CAA (Certification Authority Authorization)**:
+A DNS record naming which CAs may issue for a domain, checked **by the CA at issuance** and
+never by a client at connection time. The CA walks up the tree from the requested name and
+stops at the first record found. Absence means every CA is permitted — it is an opt-in
+restriction, not a whitelist.
+_Avoid_: certificate whitelist, CA policy record
+
+**ACME**:
+The protocol (RFC 8555) by which a client proves control of a name and receives a
+certificate without human involvement. The proof is bound to the client's **account key**,
+so a challenge token alone is useless to anyone else. The account key and the certificate's
+key are different keys.
+_Avoid_: Let's Encrypt API, certbot protocol
+
+**HTTP-01 / DNS-01**:
+The two ways of proving control of a name. HTTP-01 serves a token at
+`http://<name>/.well-known/acme-challenge/` and therefore requires inbound **port 80** —
+impossible behind a NAT you do not control. DNS-01 publishes a `TXT` at
+`_acme-challenge.<name>`, works from anywhere because the proof travels into the zone
+rather than to the machine, and is the **only** way to obtain a wildcard.
+_Avoid_: HTTP validation, DNS validation, domain verification
+
+**SNI (Server Name Indication)**:
+The hostname the client puts in `ClientHello`, in **cleartext**, so the server can choose a
+certificate before any encrypted channel exists. It is the reason many sites share one IP,
+and the reason encryption does not hide *which* site you visit. A literal IP address may
+not be sent as SNI, so connecting by address sends none at all and the server falls back to
+its default virtual host.
+_Avoid_: hostname header, Host, domain in the request
+
+**TLS termination**:
+Decrypting TLS at a boundary — typically a reverse proxy — and passing plain HTTP to the
+application behind it. The application never handles certificates and does not know TLS
+exists. This is what makes one certificate serve many applications.
+_Avoid_: SSL offloading, decryption, HTTPS proxying
+
+**Reverse proxy**:
+A server that accepts connections on behalf of applications behind it, chosen by name and
+path. It is a **trust boundary and a multiplexer**: it terminates TLS, puts many
+applications on one port 443, sets and sanitises `X-Forwarded-*` so the application sees
+real clients rather than `127.0.0.1`, and buffers slow clients so one bad connection cannot
+occupy an application worker. A forward proxy is the mirror image — it acts for the client,
+who knows it is there.
+_Avoid_: load balancer, gateway, proxy
+
+**Forward secrecy**:
+The property that recording traffic today and stealing the server's private key later still
+does not decrypt the recording, because session keys come from an **ephemeral** key exchange
+and the certificate's key only signs. TLS 1.3 removed the key-exchange modes that lacked it.
+_Avoid_: encryption strength, perfect security

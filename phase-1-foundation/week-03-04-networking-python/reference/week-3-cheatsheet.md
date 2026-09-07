@@ -5,7 +5,7 @@ Compressed from days 13 onward. Full write-ups and command history live in each 
 the repository's `GLOSSARY.md`. This is the version to reread weeks later: mechanisms and
 why they bite.
 
-Built up as the week lands; days 15-17 are still to come.
+Built up as the week lands; day 17 is still to come.
 
 ## Layers, addressing, routing (day 13)
 
@@ -539,3 +539,217 @@ out its own timer.
 - Nameservers are anycast, and even their addresses vary between runs.
 - A typo in `@server` gives `couldn't get address for ...` — a different **class** of
   failure: the query was never asked, because the server's own name would not resolve.
+
+## TLS, HTTP, publishing (day 16)
+
+### A certificate answers one question, and it is not the one people think
+
+Verification is three mechanical checks and nothing else:
+
+1. **Signature chains to a trusted root.** Leaf signed by an intermediate, intermediate by
+   a root that is already in the client's trust store. A root is self-signed — its
+   authority is not derived from anything, it is a decision by whoever built the store.
+2. **The name matches, in `SAN`.** `CN` has been ignored since 2017. A wildcard covers
+   exactly one label, and an IP address must be present as type `iPAddress`, not as text.
+3. **The dates are current.** Which makes a wrong system clock look like a network outage.
+
+What passes all three still does not mean the server is honest. A valid certificate says
+**"somebody proved control of this name"**, nothing more. A phishing domain gets one in
+thirty seconds. Identity and trustworthiness are different claims, and TLS only makes the
+first.
+
+The certificate itself is **public** — handed to every client, and published in
+Certificate Transparency logs permanently. The private key is the only secret, and the CA
+never sees it: what travels in the CSR is the public half. That asymmetry is the reason the
+whole scheme is worth anything.
+
+The operational side of CT worth remembering: every name you take a certificate for becomes
+public forever. `crt.sh` is a ready map of a company's infrastructure — `staging.`,
+`jenkins.`, `vpn-old.` — and reconnaissance starts there, not with scanning.
+
+### Chain building and chain validation are different, and only one is uniform
+
+Validating a chain is deterministic and identical everywhere. **Assembling** it is not — it
+depends on what the client already has and how hard it will work:
+
+| Stack | Missing intermediate |
+|---|---|
+| OpenSSL / GnuTLS (Linux curl, Go, Java, most clients) | fails: `unable to get local issuer certificate` |
+| Browsers | usually succeed — cached intermediate, or fetched via the leaf's `AIA` |
+| macOS Security.framework (**including Apple's `curl`**) | succeeds — fetches `AIA`, caches in the keychain |
+
+This is the day's real lesson, and it is sharper than the rule it replaces. "Check with
+`curl`, not a browser" is not enough, because **the behaviour belongs to the TLS stack, not
+to the program**. A configuration serving only the leaf was verified as healthy from a
+macOS laptop and rejected by every Linux client — every CI job, container, webhook and
+server-to-server call.
+
+The rule that survives: **verify from a stack that matches production.** A green result
+from the wrong validator is worse than no result, because it closes the question falsely.
+
+The historical proof that chain building is where things break: when `DST Root CA X3`
+expired in 2021, no server changed by a byte, and the internet broke for old Android and
+OpenSSL 1.0.2 — clients that could not construct an alternative path. **A certificate can
+fail without anything on your side changing**, because half the conditions live in the
+client.
+
+### The four files, and why the wrong one is the obvious one
+
+`cert.pem` leaf only · `chain.pem` intermediate only · `fullchain.pem` both · `privkey.pem`
+the secret. `ssl_certificate` wants **`fullchain.pem`**.
+
+`grep -c "BEGIN CERTIFICATE"` on the three prints 1, 1, 2 — the entire chain model as three
+numbers.
+
+The trap survives because everything points the wrong way: the file is called `cert.pem`,
+the directive is called `ssl_certificate`, `nginx -t` passes, the service starts, and the
+browser works. **The server side is entirely green.** Only a non-browser client on a
+different machine disagrees.
+
+A chain failure also leaves **nothing in `access.log`** — the handshake dies right after
+the `Certificate` message, before any request exists. "Unreachable, but the access log is
+silent" is the signature of TLS rather than of the application.
+
+### What the handshake gives away
+
+Before encryption can start, the client has to say who it wants. In cleartext:
+
+- **SNI** — the hostname. Necessary because the server must pick a certificate *before* it
+  can read the HTTP `Host` header, which is inside the channel that does not exist yet.
+- **ALPN** — the protocol being negotiated (`h2`, `http/1.1`).
+- Versions and cipher list — from which clients are fingerprinted.
+- In TLS 1.2, **the server's certificate** as well; encrypted from 1.3 onward.
+
+So encrypting the payload does not hide **whom you are talking to**. Anyone on the path
+sees IP + SNI, which is a complete list of sites visited — the basis of corporate DPI and
+state blocking, and the hole ECH exists to close (and ECH needs encrypted DNS too, or the
+name simply leaks one layer down).
+
+Connecting by IP address sends **no SNI at all** — RFC 6066 forbids a literal address
+there. The server then falls back to its **default virtual host** and presents whatever
+certificate that block holds, for a name the client never asked about. Hence an explicit
+`default_server` stub on any machine hosting more than one site.
+
+Two more properties worth being able to state:
+
+- **Forward secrecy**: session keys come from an ephemeral key exchange, and the
+  certificate's key only *signs*. Traffic recorded today stays unreadable even if the
+  server key is stolen next year. TLS 1.3 removed the modes that lacked this.
+- **0-RTT** sends data with the first packet and is **replayable** — safe only for
+  idempotent requests, which is why it is off by default.
+
+### ACME: the proof is bound to your account key
+
+The challenge value is `token + "." + thumbprint(account key)`, so a token intercepted or
+planted by someone else is useless — they cannot compute the response. The account key and
+the certificate key are separate keys: one authenticates API calls, the other is the
+server's identity.
+
+| | HTTP-01 | DNS-01 |
+|---|---|---|
+| Proof | a file under `/.well-known/acme-challenge/` | a `TXT` at `_acme-challenge.<name>` |
+| Requires | inbound **port 80** | API access to the DNS provider |
+| Behind NAT | **impossible in principle** | works |
+| Wildcard | impossible in principle | the only way |
+
+HTTP-01 cannot be moved off port 80 by design — otherwise anyone holding an unprivileged
+port could claim the name. And no HTTP request can prove control over *every* subdomain,
+which is why wildcards are DNS-01 only.
+
+The cost of DNS-01 is a token that can rewrite your zone. Scope it to one zone with edit
+rights on records only, store it `0600` root-owned, and create the file already empty at
+those permissions (`install -m 600 /dev/null`) rather than writing it and fixing the mode
+afterwards.
+
+Rate limits are real — **5 failed validations per hour** is the one that hurts — so staging
+(`--dry-run`) first, always.
+
+### Renewal is two events, and only the first one reports itself
+
+`live/` holds symlinks into `archive/`, so the path in the web server config never changes
+across renewals. The corollary is that the web server **holds the old file open and never
+learns the symlink moved**: without a reload it serves the expired certificate until
+someone notices, on day 90.
+
+Hence a `deploy` hook — not `post`. The timer fires twice a day; over a certificate's life
+that is ~180 attempts and one real renewal. `deploy` runs only when something actually
+changed, and `$RENEWED_LINEAGE` tells it which certificate, so one site's renewal does not
+reload another's service.
+
+And the wider lesson, which generalises far past certbot: **its exit status means
+"certificate obtained", not "the server is serving it".** It prints `Congratulations` over a
+failed deploy hook, correctly, because those are different claims. Monitor **what the server
+presents on the wire**, never what is on disk.
+
+### Reverse proxy: a trust boundary and a multiplexer
+
+TLS termination is the obvious job and the least interesting one. The rest:
+
+- **Many applications behind one port 443**, split by `Host` and path. There is one port
+  443 and ten applications.
+- **Headers as a trust boundary.** Behind a proxy every client looks like `127.0.0.1`, so
+  `X-Forwarded-For` / `-Proto` / `Host` carry the truth — and because clients send those
+  headers too, they may be trusted **only** when set by your own proxy. Missing
+  `X-Forwarded-Proto` is the classic infinite redirect loop: the app sees plain HTTP and
+  redirects to HTTPS forever.
+- **Buffering slow clients**, so one bad connection cannot occupy an application worker.
+  That is a defence against Slowloris, not an optimisation.
+
+In Kubernetes this exact role is the Ingress Controller, and an `Ingress` is a declarative
+description of the same name-and-path rules. Doing it by hand once makes the manifest a
+translation rather than a new language.
+
+The proxy's own vocabulary, which is diagnosis rather than decoration:
+
+- **`502`** — reached the upstream, got garbage or a reset. The application crashed or
+  speaks the wrong protocol.
+- **`503`** — the proxy knows there is no upstream to reach.
+- **`504`** — connected, and the upstream did not answer in time. The application is alive
+  but slow.
+
+### HTTP generations each removed head-of-line blocking one layer down
+
+**1.1**: one request at a time per connection; `keep-alive` saves the TCP+TLS handshake, but
+a slow response blocks the queue. Reuse requires knowing where a response ends —
+`Content-Length` or `Transfer-Encoding: chunked`. Pipelining was standardised and is dead,
+because responses must return in request order.
+
+**2**: many streams multiplexed over one TCP connection, binary framing, header compression.
+`Host` becomes the `:authority` pseudo-header and all header names are lowercase by rule.
+Solves blocking at the HTTP layer — but not at TCP's: one lost segment stalls **every**
+stream, because TCP guarantees order.
+
+**3**: therefore moves to QUIC over UDP, where ordering is per-stream and a loss in one
+stream does not block the others. It also merges the transport and cryptographic handshakes
+into one round trip.
+
+Methods are described by two independent properties: **safe** (changes nothing:
+`GET`, `HEAD`, `OPTIONS`) and **idempotent** (N times equals once: those plus `PUT`,
+`DELETE`). This is not theory — proxies and clients silently retry idempotent requests after
+a broken connection and refuse to retry `POST`.
+
+### The errors, by layer
+
+| Symptom | What arrived | Speed | Layer |
+|---|---|---|---|
+| `curl: (28)` timeout | nothing | slow | packet dropped — firewall `DROP` |
+| `curl: (7)` refused | TCP **RST** | instant | host reached, **nothing listening** |
+| `curl: (60)` issuer | TLS alert `unknown CA` | after handshake starts | chain incomplete |
+
+**An instant failure is an answer; a slow one is silence.** An answer means you reached the
+stack on the other side.
+
+A listening socket and a firewall rule are independent conditions, and each tool sees only
+its own: `ss` proves a process is listening and says nothing about reachability. "But I
+opened 443" is usually true and usually not the problem.
+
+### The route and the identity are independent
+
+`curl --resolve` overrides **only** where the packet goes. The URL still supplies the SNI,
+the `Host` header and the name that gets verified — so it is an honest test, not a
+workaround. Connecting to the same address by IP instead fails, because now the URL names
+the IP and that is what verification demands.
+
+Which is the same fact from both sides: **the certificate certifies the name, not the
+path.** That is deliberate — if DNS is hijacked and you land on the wrong server, name
+verification is exactly what catches it.
