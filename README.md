@@ -43,7 +43,7 @@ phase-1-foundation/
     reference/               ← cheat sheets + lookup card
     artifact-server-bootstrap/   ← deliverable: idempotent server bootstrap
   week-03-04-networking-python/
-    CURRICULUM.md            networking (days 13–17), Python (days 18–22)
+    CURRICULUM.md            networking (days 13–17), Python (days 18–19)
     day-NN-topic/NOTES.md    what was done, what broke, what was learned
     reference/               ← lookup card for this block
     artifact-lab-probe/          ← deliverable: external prober for the lab
