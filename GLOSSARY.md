@@ -295,6 +295,49 @@ answers with different latencies, different instance identifiers (`dig +nsid`) a
 cache contents depending on where the query entered the network.
 _Avoid_: Load balancing, CDN, round-robin
 
+**NAT (Network Address Translation)**:
+Rewriting addresses and ports in a packet in flight, plus the table that records each
+rewrite so the reply can be rewritten back. The row is created by the **outbound** packet,
+which is why an unsolicited inbound packet has nowhere to go — not because policy forbids
+it, but because nothing identifies which internal host was meant. Port forwarding is that
+same row installed by hand; the security people attribute to NAT is a side effect of the
+table, never a design goal.
+_Avoid_: Firewall, masking, IP hiding, port mapping
+
+**CGNAT (Carrier-Grade NAT)**:
+NAT performed a second time inside the ISP's network, so a subscriber's router holds a
+private WAN address (`100.64.0.0/10` per RFC 6598, or ordinary RFC 1918 space) rather than a
+public one. Inbound connections then cannot be arranged at all: a forwarding rule on your
+own router is well-formed and never reached, because the packet is discarded one NAT
+earlier, in a table you do not own.
+_Avoid_: Double NAT, shared IP, ISP firewall
+
+**Connection tracking (conntrack)**:
+The kernel table recording every connection passing through a machine, against which each
+packet is classified `NEW`, `ESTABLISHED`, `RELATED` or `INVALID`. A row is a **pair of
+tuples** — how the packet leaves and how the reply must return — so a reply tuple that is
+not an exact mirror of the original is [[nat-network-address-translation]] made visible. In Linux the translation is
+stored as an attribute of the row, which makes NAT and stateful filtering one mechanism read
+two ways. UDP and ICMP are given invented state with timeouts.
+_Avoid_: Session table, NAT table, state table
+
+**Stateful firewall**:
+A packet filter that decides from [[connection-tracking-conntrack]] rather than from the
+packet alone, so a single `ESTABLISHED,RELATED → ACCEPT` rule admits the replies to every
+outbound connection. Without it, permitting replies means permitting all high ports, since
+source ports are random — which is why stateless filters were unusable in practice. The
+corollary is that an existing session survives any rule change, so **only a new connection
+tests a rule**.
+_Avoid_: Firewall, packet filter, iptables
+
+**ECMP (Equal-Cost Multi-Path)**:
+Spreading traffic across several routes of equal cost by hashing each flow's headers, so
+that a flow stays on one path while different flows do not. It is why one `traceroute` hop
+answers from several addresses — each probe varies the destination port and therefore
+hashes differently — and why a real connection, whose 5-tuple is fixed, uses exactly one of
+those paths, possibly one the trace never showed.
+_Avoid_: Load balancing, round-robin, multipath
+
 ### TLS and HTTP
 
 **X.509 certificate**:

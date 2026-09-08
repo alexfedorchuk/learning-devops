@@ -753,3 +753,278 @@ the IP and that is what verification demands.
 Which is the same fact from both sides: **the certificate certifies the name, not the
 path.** That is deliberate — if DNS is hijacked and you land on the wrong server, name
 verification is exactly what catches it.
+
+---
+
+## Network diagnostics, NAT, firewall (day 17)
+
+### NAT is a table, and everything else follows from that
+
+A NAT router rewrites the source address and port of an outgoing packet and **records the
+translation**, so the reply can be rewritten back. The port is not "which service" here —
+it is the **index into the translation table**, which is what lets hundreds of hosts share
+one address (properly NAPT; masquerade is the Linux name).
+
+The row is created by the **outbound** packet. An unsolicited inbound packet finds no row,
+and the failure is not a policy decision — it is missing information: the packet says "to
+the public address, port 443", and nothing in it identifies which internal host was meant.
+
+Two consequences, each worth one sentence:
+
+- **Port forwarding is that same row, installed by hand and permanently.** Not a
+  permission — a static translation.
+- **NAT is not a security mechanism.** It exists because addresses were scarce; being
+  unreachable from outside is a side effect of the table. Treating it as a firewall is how
+  unauthenticated services end up on a LAN where any compromised device reaches them.
+
+**CGNAT** is the same thing done a second time at the ISP's edge. Then a forwarding rule on
+your own router is well-formed and useless, because the packet dies one NAT earlier. The
+problem is not configuration — it is **not owning the box that holds the table**.
+
+Diagnosing it needs three addresses, not one:
+
+| Where | How |
+|---|---|
+| LAN address and gateway | `ip route get 1.1.1.1` |
+| The router's WAN address | the router's admin UI |
+| What the internet sees | `curl -s https://ifconfig.me` |
+
+WAN equal to the public address means one NAT and forwarding can work. WAN in
+`100.64.0.0/10` (RFC 6598, reserved for exactly this) or in RFC 1918 space means CGNAT.
+`traceroute` confirms independently: private hops after your router, and the NAT boundary
+sits at the first public address.
+
+### Conntrack: why a stateful firewall is possible at all
+
+Default-deny inbound, allow outbound. The reply to your own outbound connection **is** an
+inbound packet. Statelessly, permitting it means permitting all of `1024–65535`, since the
+source port is random — which is why stateless filters were useless in practice.
+
+The kernel keeps `nf_conntrack` and classifies every packet against it: `NEW`,
+`ESTABLISHED`, `RELATED`, `INVALID`. One rule, `ESTABLISHED,RELATED → ACCEPT`, then covers
+every reply that will ever exist, because the decision comes from memory rather than from
+the packet.
+
+**In Linux, NAT is stored as an attribute of the conntrack row** — one table, two readers.
+A row is a *pair of tuples*: how the packet goes out, how the reply must come back.
+
+```
+tcp 6 431999 ESTABLISHED
+    src=A dst=B sport=x dport=22    ← original
+    src=B dst=A sport=22 dport=x    ← reply
+    [ASSURED]
+```
+
+> **If the reply tuple is not an exact mirror of the original, translation happened — and
+> the row shows what it was rewritten to.** That is how NAT is read out of conntrack.
+
+- The countdown is a **timeout in seconds**: `432000` = **5 days** for an established TCP
+  connection (`nf_conntrack_tcp_timeout_established`). Home routers shorten it to minutes,
+  which is the entire reason for `ServerAliveInterval` and TCP keepalive.
+- `[ASSURED]` = traffic seen both ways. Under table pressure non-assured rows are evicted
+  **first**, so scan garbage dies before real sessions.
+- `RELATED` is not mainly about FTP: it carries **ICMP errors belonging to a connection**,
+  including `fragmentation needed` for Path MTU Discovery. Block ICMP "for security" and you
+  get day 14's symptom exactly — small pages load, large ones hang forever.
+- UDP and ICMP get invented state with timeouts (UDP 30 s, 120 s after a reply). A stateful
+  UDP firewall is a useful fiction.
+- The table is finite. `nf_conntrack_max` is derived from RAM — **7680 on a 1 GB Pi**. One
+  `nmap -p-` creates a row per probed port, 65535 of them. Overflow logs
+  `nf_conntrack: table full, dropping packet` and produces the signature symptom:
+  **existing connections fine, new ones fail.**
+
+### Rule order, and the two different algorithms
+
+| | Which rule wins |
+|---|---|
+| **Routing** (day 13) | **longest prefix** — position in the table is irrelevant |
+| **Firewall** | **first match** — position is everything |
+
+So a default route with `/0` can sit anywhere and still apply last, while a `deny` placed
+after an `allow` never applies at all.
+
+The evidence is the **packet counter**, not the rule text:
+
+```
+1    4   256  ACCEPT  tcp dpt:22  'dapp_OpenSSH'
+4    0     0  DROP    tcp dpt:22  src 192.168.0.193    ← zero
+```
+
+A rule with a zero counter is not wrong, it is **too late** — the decision was made above
+it. `iptables -L <chain> -v -n --line-numbers` is the view to use even on an nftables
+system, precisely because it prints per-rule counters.
+
+Also: `ufw status numbered` and `iptables -L` do **not** share numbering — ufw numbers v4
+and v6 in one list, `iptables` shows one family. `ufw insert N` uses ufw's numbers. And
+delete by specification, not by number: `ufw delete deny from X to any port 22 proto tcp`.
+
+### A live session proves nothing about the rules
+
+Every counter in `ufw-user-input` reads **64 bytes per packet** — the size of a SYN.
+Nothing but SYNs reaches the user chain, because `ESTABLISHED` is accepted several chains
+earlier in `ufw-before-input`. A rule permitting a busy service can honestly read `4`: it
+counts **connections**, not traffic.
+
+> A firewall filters **connections, not people.** A live session is not evidence the rules
+> are right — it is evidence conntrack remembers it. Only a **new** connection tests a rule.
+
+This is how people lock themselves out: change rules, see the session survive, conclude
+success, reboot into an empty table. The habit that prevents it is a rollback that runs
+without you:
+
+```bash
+sudo systemd-run --on-active=600 --unit=ufw-rollback ufw insert 1 allow 22
+sudo systemctl stop ufw-rollback.timer      # cancel once verified
+```
+
+`DROP` vs `REJECT` priced exactly: one blocked `ssh` attempt produced **10 SYNs over ~2
+minutes** of exponential backoff into silence. `REJECT` costs one packet and an instant
+error.
+
+### Why `traceroute` lies, in four separate ways
+
+Intermediate routers answer with `TTL exceeded` generated by the **CPU**, at the lowest
+priority, while forwarding happens in hardware. Everything below follows from that.
+
+1. **Latency is not monotonic.** A later hop can report a smaller number than an earlier
+   one. The figure measures *how quickly that router's control plane got round to
+   replying*, not distance.
+2. **"Loss" at a middle hop is usually ICMP rate limiting.** Routers cap error generation
+   (`net.ipv4.icmp_ratelimit` and vendor equivalents). The packets were forwarded; the
+   *reports* were declined.
+3. **There is no single path.** ECMP spreads flows across parallel links by hash, and
+   traceroute varies the destination port per probe — so each probe may take a different
+   line. Three addresses at one hop is normal. Your real TCP connection has a fixed
+   5-tuple, hashes consistently, and uses exactly **one** line, possibly one you were never
+   shown.
+4. **Every number is a round trip.** Return paths are asymmetric and chosen by other
+   networks, so a spike at hop N may be entirely caused by that router's return path — a
+   path your traffic never uses.
+
+**Only the last line is a measurement.** Everything above it is hearsay gathered from busy
+foreign CPUs over several different roads.
+
+`mtr` is the corrective, because it shows a distribution instead of one sample:
+
+```bash
+mtr -n --report --report-cycles 20 1.1.1.1
+mtr -n -T -P 443 <host>     # TCP probes to the port that actually matters
+```
+
+Read the `Loss%` column and ask **whether it survives to the last line**:
+
+> **Loss that decreases down the path is rate limiting. Real loss can only accumulate,
+> because a lost packet does not reappear.** `55% → 40% → 0%` is a healthy path.
+
+Same for jitter: `Wrst 110 ms` at a middle hop with `StDev 1.0` at the destination is CPU
+scheduling, not the network. And a loss figure that differs between runs and between probe
+types is not a measurement at all.
+
+### `tcpdump` without fooling yourself
+
+```bash
+sudo tcpdump -nn -i any 'port 22 and host 10.0.0.5'
+```
+
+- **`-nn` always.** One `n` skips address resolution, two also skips ports. Without it
+  tcpdump issues a DNS query per packet — slow, and when debugging DNS it captures the
+  traffic it generated itself.
+- **The filter is BPF and compiles into the kernel**, so it applies **at capture time**.
+  Whatever is not asked for never existed. Start broad, narrow afterwards — an
+  over-specific filter throws away the packet that explains the problem.
+- `-c N` bounds the capture; `-w file.pcap` writes raw. **Capture on the server, analyse on
+  the workstation** — never open a large pcap on a Pi.
+
+**Never capture on the channel you are watching the capture through.** Filtering `port 22`
+while connected over SSH is a closed loop: each printed line is sent over port 22, matches
+the filter, and prints another line. Exclude the control session:
+
+```bash
+sudo tcpdump -nn -i any "port 22 and host $C and not port $(echo $SSH_CLIENT | awk '{print $2}')"
+```
+
+The substitution runs in the shell *before* `sudo`, so `$SSH_CLIENT` is still visible.
+**Silence is the correct state of a capture.**
+
+Read by **shape**: `[S]` `[S.]` `[.]` `[P.]` `[F.]` `[R]`, the sizes, the duration, the
+close. `[S]` with no `[S.]` is a `DROP`; `[S]` answered by `[R]` is a `REJECT` or a closed
+port. `[SEW]`/`[S.E]` is ordinary SYN/SYN-ACK with ECN negotiated (macOS does this by
+default).
+
+Duration is a diagnosis on its own: three SSH connections **168 ms** each, byte-identical,
+mean no human was involved and no prompt was ever reached.
+
+### The wire tells you who; the log tells you what
+
+`tcpdump` shows the SSH version banners in cleartext — both sides, before any
+authentication, including the exact distribution package revision. Yesterday it was SNI,
+today a version string: **encryption protects content, never the negotiation that
+establishes it.** After the banners everything is opaque; you see that bytes moved, not what
+they said.
+
+So the log is the other half — and they are joined by the **source port**, not the
+timestamp:
+
+```
+sshd[6907]: Invalid user nosuchuser from 192.168.0.193 port 54755
+sshd[6907]: Connection closed by invalid user ... port 54755 [preauth]
+```
+
+`Invalid user` goes to the log and never to the client, which receives a flat
+`Permission denied` — telling the two apart in the reply would be a username-enumeration
+oracle. `[preauth]` means it died before authentication finished. Consecutive PIDs stepping
+by two are `sshd`'s per-connection fork plus its privilege-separation child.
+
+> **On a key-only server, `Failed password` never appears.** Any brute-force protection
+> keyed to that line reports healthy and bans nobody — hardening quietly disarms the
+> protection people install first.
+
+### `main` vs `universe` — day 8, corrected
+
+| Component | Maintained by | Security updates |
+|---|---|---|
+| `main` | Canonical | guaranteed for the LTS lifetime |
+| `universe` | the community | **best effort**; may be broken and stay broken |
+
+Distributions **freeze** a version at release and backport chosen fixes by hand. In `main`
+that work is contractual; in `universe` it needs a volunteer. So read the component in
+`apt policy` before installing, not after the crash.
+
+But `apt policy` only reports what **this machine can see**, and that is a trap with teeth.
+`fail2ban 1.0.2-3` in Ubuntu 24.04 cannot start at all — it imports `asynchat`, removed from
+the standard library in Python 3.12 (PEP 594). `apt policy` showed `1.0.2-3` as both
+Installed and Candidate from `noble/universe`, which reads exactly like "no fix exists".
+There is one: `1.0.2-3ubuntu0.1`, published to **`noble-updates`** on 2024-06-27. The
+machine simply had no `noble-updates` in its sources.
+
+```bash
+grep '^Suites:' /etc/apt/sources.list.d/ubuntu.sources
+```
+
+`<release>`, `<release>-updates` and `<release>-security` should all appear. Without
+`-updates` a machine gets security fixes and **no bug fixes at all** — and every `apt policy`
+answer it gives is quietly incomplete.
+
+> **A diagnosis inherits the configuration of the tool that produced it.** `apt policy` was
+> honest about this machine and was read as a claim about the archive.
+
+Which is day 16's false pass in different clothes: there a broken chain was certified healthy
+by an unrepresentative TLS stack, here a package sitting in the archive was declared
+nonexistent by an unrepresentative apt configuration. **A confident answer from a
+misconfigured instrument is worse than no answer, because it closes the question** — and a
+plausible explanation arriving early (`universe`, in one word) is what stops the
+investigation before the instrument is checked.
+
+The general form, now on its fourth instance in two days: **installing successfully is not
+running successfully.** `apt` places files; `certbot` obtains certificates; a firewall rule
+sits in a table. None of them promise the outcome you wanted. `systemctl status` after
+install, a **new** connection after a rule change, the wire after a config reload.
+
+`ufw` has built-in rate limiting and needs no package for it:
+
+```bash
+sudo ufw limit OpenSSH      # blocks a source after 6 new connections in 30 s
+```
+
+It counts connections, not authentication failures — it cannot tell a brute-force attempt
+from an eager client.

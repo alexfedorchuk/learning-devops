@@ -544,3 +544,192 @@ a foreground process dies with the SSH session.
 With several sites on one machine, define an explicit `default_server`: a request arriving
 by IP sends **no SNI at all**, and nginx answers it with the first `server` block for that
 socket, handing over a certificate for a name nobody asked about.
+
+## Am I behind NAT, and can anything reach me from outside
+
+```bash
+ip route get 1.1.1.1                 # LAN address + the gateway actually used
+curl -s https://ifconfig.me; echo    # the address the internet sees
+# third address: the router's WAN, from its admin UI — no command for this
+```
+
+Compare all three. WAN equal to the public address → one NAT, port forwarding can work.
+WAN in `100.64.0.0/10` (RFC 6598) or in RFC 1918 space → **CGNAT**: forwarding on your own
+router is well-formed and useless, because the packet dies at the ISP's NAT first.
+
+```bash
+traceroute -n 1.1.1.1     # private hops after your router = the ISP's core is behind NAT
+```
+
+The NAT boundary is at the first public address in the list.
+
+## The path to a host looks bad — is it really
+
+```bash
+sudo apt install -y traceroute mtr-tiny
+traceroute -n <host>
+mtr -n --report --report-cycles 20 <host>
+mtr -n -T -P 443 <host>       # TCP probes on the port that matters
+```
+
+**Read the `Loss%` column bottom-up.** Loss at a middle hop that is *lower* at the next hop
+is ICMP rate limiting, not loss — real loss can only accumulate. `55% → 40% → 0%` is a
+healthy path.
+
+Traps, all caused by intermediate routers generating ICMP errors in their CPU at lowest
+priority:
+
+- Latency is **not** monotonic; a later hop may report less than an earlier one.
+- Several addresses at one hop = ECMP. Your real connection has a fixed 5-tuple and uses
+  exactly one of those paths.
+- Every figure is a **round trip**, and return paths are asymmetric.
+- High `Wrst`/`StDev` at a middle hop with a stable destination is CPU scheduling.
+
+**Only the last line is a measurement.**
+
+## What is actually on the wire
+
+```bash
+sudo tcpdump -nn -i any 'port 443 and host 10.0.0.5'
+sudo tcpdump -nn -i any 'tcp port 22' -c 50          # bounded
+sudo tcpdump -nn -i eth0 'port 53' -w /tmp/dns.pcap  # capture here, analyse elsewhere
+sudo tcpdump -nn -r /tmp/dns.pcap
+```
+
+`-nn` **always** — one `n` skips address resolution, two also skips ports; without it
+tcpdump makes a DNS query per packet and, when debugging DNS, captures its own traffic.
+
+The filter is BPF and runs **in the kernel at capture time**: what you did not ask for never
+existed. Start broad, narrow later.
+
+**Never capture the channel you are watching through** — filtering `port 22` over SSH is a
+feedback loop that never stops. Exclude the control session:
+
+```bash
+sudo tcpdump -nn -i any "port 22 and not port $(echo $SSH_CLIENT | awk '{print $2}')"
+```
+
+Substitution happens before `sudo`, so `$SSH_CLIENT` is still set. Silence afterwards is
+correct.
+
+Flags: `[S]` SYN · `[S.]` SYN-ACK · `[.]` ACK · `[P.]` data · `[F.]` FIN · `[R]` RST ·
+`[SEW]`/`[S.E]` the same with ECN negotiated. `[S]` with no reply = `DROP`; `[S]` → `[R]` =
+`REJECT` or nothing listening.
+
+## Who is in the connection tracking table
+
+```bash
+sudo apt install -y conntrack
+sudo conntrack -C                              # how many flows right now
+sudo conntrack -L -p tcp --dport 22            # one service
+cat /proc/sys/net/netfilter/nf_conntrack_max   # the ceiling (RAM-derived; 7680 on 1 GB)
+```
+
+A row is a **pair of tuples** — original direction, then reply direction:
+
+```
+tcp 6 431999 ESTABLISHED src=A dst=B sport=x dport=22 src=B dst=A sport=22 dport=x [ASSURED]
+        └── timeout, seconds. 432000 = 5 days for established TCP
+```
+
+**If the reply tuple is not an exact mirror, NAT happened** — and the row shows the
+translation. `[ASSURED]` = seen both ways; non-assured rows are evicted first when the table
+fills. Overflow logs `nf_conntrack: table full, dropping packet` in `dmesg`, and the symptom
+is **existing connections fine, new ones fail**.
+
+## A firewall rule was added and traffic still flows
+
+```bash
+sudo ufw status numbered
+sudo iptables -L ufw-user-input -v -n --line-numbers   # per-rule packet counters
+sudo iptables -L ufw-before-input -v -n                # where ESTABLISHED is accepted
+```
+
+**Firewalls are first-match-wins** (routing is longest-prefix — different algorithm, same
+machine). A rule with a **zero counter** is not wrong, it is *too late*: something above it
+already decided.
+
+```bash
+sudo ufw insert 1 deny from 10.0.0.9 to any port 22 proto tcp   # position 1, not appended
+sudo ufw delete deny from 10.0.0.9 to any port 22 proto tcp     # delete by spec, not number
+```
+
+`ufw status numbered` and `iptables -L` do not share numbering — ufw counts v4 and v6 in one
+list. `ufw insert N` uses ufw's numbers.
+
+Counters in `ufw-user-input` read **64 bytes per packet** because only SYNs get that far;
+they count **connections**, not traffic.
+
+## Changing firewall rules over SSH without locking yourself out
+
+```bash
+sudo systemd-run --on-active=600 --unit=ufw-rollback ufw insert 1 allow 22
+# ... make and verify the change ...
+sudo systemctl stop ufw-rollback.timer
+```
+
+A transient timer runs independently of your shell, so it fires even if the session dies.
+
+**Your live session is not a test.** It survives any rule change because its conntrack row
+is accepted before user rules are consulted — only a **new** connection tests a rule. The
+classic lockout is: change, see the session survive, reboot into an empty table.
+
+`ufw` uses `DROP`, so a blocked client hangs for ~2 minutes and ~10 retransmitted SYNs
+rather than failing immediately.
+
+Built-in brute-force limiting, no extra package:
+
+```bash
+sudo ufw limit OpenSSH     # blocks a source after 6 new connections in 30 s
+```
+
+Counts connections, not failed logins.
+
+## Is this package actually maintained
+
+```bash
+apt policy <package>       # read the COMPONENT in the version table
+```
+
+`main` = Canonical, guaranteed security updates for the LTS lifetime.
+`universe` = community, **best effort** — can ship broken and stay broken for the whole
+release. Check before installing, not after the crash.
+
+**Check the suites before trusting any of it** — `apt policy` reports what this machine can
+see, not what exists in the archive:
+
+```bash
+grep '^Suites:' /etc/apt/sources.list.d/ubuntu.sources
+```
+
+`<release>`, `<release>-updates` and `<release>-security` should all be present. Without
+`-updates` the machine gets security fixes and **no bug fixes**, and `apt policy` will report
+"no newer version" for packages that were fixed years ago. To fix:
+
+```bash
+sudo sed -i.bak 's/^Suites: noble$/Suites: noble noble-updates/' /etc/apt/sources.list.d/ubuntu.sources
+sudo apt update && apt list --upgradable
+```
+
+The anchored `$` matters — it leaves the `noble-security` stanza alone. Expect a backlog on
+first run.
+
+```bash
+systemctl status <service> --no-pager    # after every install
+```
+
+**Installing successfully is not running successfully.** `apt` promises files on disk,
+nothing more.
+
+## Correlating a packet capture with an application log
+
+Join on the **source port**, never the timestamp — the port identifies one connection,
+timestamps collide at any real volume.
+
+```bash
+sudo journalctl -u ssh --since '10 min ago' --no-pager
+```
+
+On a key-only server there is no `Failed password` line at all; refused attempts read
+`Invalid user <name> from <ip> port <n>` and `Connection closed by ... [preauth]`. Any
+protection keyed to `Failed password` bans nobody and reports healthy.
